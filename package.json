@@ -1,0 +1,12 @@
+{
+  "name": "opencode-mirasim-auth",
+  "version": "0.1.0",
+  "description": "Mirasim relay subscription in OpenCode and magpie",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": ["index.mjs", "README.md"],
+  "keywords": ["opencode", "opencode-plugin", "magpie", "mirasim"],
+  "license": "MIT",
+  "magpie": { "icon": "data:image/svg+xml;base64,PHN2ZyBmaWxsPSJjdXJyZW50Q29sb3IiIGhlaWdodD0iMWVtIiBzdHlsZT0iZmxleDpub25lO2xpbmUtaGVpZ2h0OjEiIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjFlbSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48dGl0bGU+TWlyYXNpbTwvdGl0bGU+PHBhdGggZD0iTTIuNSAxOS41TDcuMjUgNS41IDEyIDE0IDE2Ljc1IDUuNSAyMS41IDE5LjUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIuNCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+PGNpcmNsZSBjeD0iMTIiIGN5PSIxOS42IiByPSIxLjciLz48L3N2Zz4K" }
+}
