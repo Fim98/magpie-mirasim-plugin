@@ -1,6 +1,6 @@
-# opencode-mirasim-auth
+# magpie-mirasim-plugin
 
-[Mirasim](https://mirasim.ai) 的订阅，作为 OpenCode / magpie 的插件使用。
+[Mirasim](https://mirasim.ai) 的订阅，作为 OpenCode / [magpie](https://github.com/yetone/magpie) 的插件使用，独立于 magpie 本体。
 
 - 浏览器登录（GitHub / Google），或邮箱验证码登录
 - 请求按官方桌面客户端的方式签名（Ed25519 设备密钥 + X25519/ChaCha20-Poly1305 密封）
@@ -11,9 +11,18 @@
 ## 安装（本地路径）
 
 ```
-magpie plugin add /path/to/opencode-mirasim-auth
+magpie plugin add ~/Documents/magpie-mirasim-plugin
 ```
 
-或发布为 npm 包后 `magpie plugin add <name>`。
+本地路径安装的插件不会自动更新；改了 `index.mjs` 后在 magpie 里重启插件（或重启 magpie）即可生效。也可以发布成 npm 包后 `magpie plugin add <包名>`。
+
+## 测试
+
+```
+bun test.mjs    # 与 magpie Go 实现的字节级交叉验证（cross-check.json 里的向量）
+bun e2e.mjs     # 假 Mirasim 服务器驱动的端到端测试，167 项
+```
+
+`cross-check.json` 的向量由 magpie 源码仓库里 `internal/mirasim/cross_check_test.go` 生成（`go test ./internal/mirasim -run TestCross`，可用 `MIRASIM_CROSS_FILE` 指回本目录）；协议无改动时无需重新生成。
 
 协议移植自 magpie 的 `internal/mirasim`（其又移植自 CLIProxyAPI 的 mirasim 支持与 Mirasim 桌面客户端）。
