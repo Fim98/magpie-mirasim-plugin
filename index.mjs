@@ -670,7 +670,7 @@ function specOf(roster, modelID) {
       if (agent.contextWindow > 0) spec.contextWindow = agent.contextWindow
       if (agent.maxOutput > 0) spec.maxOutput = agent.maxOutput
       if (agent.effort?.length) spec.effort = [...agent.effort]
-      if (agent.adaptiveSet) {
+      if (agent.adaptiveSet || agent.adaptive) {
         spec.adaptive = agent.adaptive
         spec.adaptiveSet = true
       }
@@ -683,23 +683,32 @@ function specOf(roster, modelID) {
 
 // thinkingAdaptive is the roster's answer to which Claude thinking form the
 // model takes: true is the effort form. known is false when the roster
-// carries no entry, which leaves the form to the caller's default (the
-// effort form, like every Claude model the relay publishes).
+// carries no shape for it, which leaves the form to the caller's default
+// (the effort form, like every Claude model the relay publishes). An agent
+// entry naming the model speaks for its shape even when it carries no flag.
 function thinkingAdaptive(roster, modelID) {
   const spec = specOf(roster, modelID)
   if (!spec) return { adaptive: false, known: false }
-  return { adaptive: spec.adaptive, known: spec.adaptiveSet }
+  if (spec.adaptiveSet) return { adaptive: spec.adaptive, known: true }
+  const id = String(modelID ?? "").toLowerCase().trim()
+  for (const entries of Object.values(roster.agents ?? {})) {
+    for (const agent of entries) {
+      if (agent.id === id) return { adaptive: agent.adaptive, known: true }
+    }
+  }
+  return { adaptive: false, known: false }
 }
 
 // ---- the thinking forms -----------------------------------------------------------
 
 // familyEfforts is the reasoning ladder a family takes when the roster says
-// nothing narrower.
+// nothing narrower. Ultra rides it because the relay accepts the request it
+// produces; the body folds it onto max before anything leaves.
 function familyEfforts(family) {
   switch (family) {
     case "codex":
     case "claude":
-      return ["low", "medium", "high", "xhigh", "max"]
+      return ["low", "medium", "high", "xhigh", "max", "ultra"]
     case "dsh":
     case "zcode":
     case "kimi":
@@ -734,6 +743,16 @@ function budgetLevel(budget) {
   if (budget <= 24576) return "high"
   if (budget <= 32768) return "xhigh"
   return "max"
+}
+
+// effortSupported narrows a roster's ladder onto the rungs the family's
+// mount takes, so the model list publishes only rungs a request can carry:
+// DeepSeek's off, three for the Chinese families, the full ladder — ultra
+// included — for Claude and GPT.
+function effortSupported(family, level) {
+  if (family === "dsh") return level === "off" || level === "low" || level === "high" || level === "max"
+  if (family === "zcode" || family === "kimi") return level === "low" || level === "high" || level === "max"
+  return level === "low" || level === "medium" || level === "high" || level === "xhigh" || level === "max" || level === "ultra"
 }
 
 // acceptsEffort clamps a level onto what the model takes: the roster's list
@@ -1400,12 +1419,17 @@ export async function MirasimAuthPlugin({ client }) {
 
 // runtimeModel is one catalog entry as OpenCode lists it: on Anthropic's
 // wire for Claude, DeepSeek, GLM and Kimi, OpenAI Responses for GPT, with
-// the reasoning ladder the roster or the family declares.
+// the reasoning ladder the roster or the family declares. The roster's shape
+// decides: the levels it lists, narrowed onto the rungs the family takes;
+// the family's own when a shape is named without a list; nothing for an
+// entry that only carries metadata, whose form the relay hasn't declared —
+// advertising one would invite a request the relay refuses.
 function runtimeModel(m, roster) {
   const family = familyOf(String(m.id).toLowerCase())
   const spec = roster ? specOf(roster, m.id) : null
   const context = Math.max(Number(m.max_input_tokens ?? 0), Number(spec?.contextWindow ?? 0))
-  const efforts = spec?.effort?.length ? spec.effort : familyEfforts(family)
+  let efforts = spec ? spec.effort.filter((level) => effortSupported(family, level)) : []
+  if (!efforts.length && (!spec || thinkingAdaptive(roster, m.id).known)) efforts = familyEfforts(family)
   const npm = family === "codex" ? OPENAI : ANTHROPIC
   return {
     id: m.id,
@@ -1451,6 +1475,7 @@ export const _internal = {
   agentFor,
   levelBudget,
   budgetLevel,
+  effortSupported,
   roundPercent,
   inferenceHeaders,
   withTokens,
