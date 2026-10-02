@@ -34,6 +34,9 @@ const MODELS = {
     { id: "claude-haiku-4-5", max_input_tokens: 180000 },
     { id: "gpt-6", max_input_tokens: 260000 },
     { id: "glm-5", max_input_tokens: 120000 },
+    { id: "claude-future-9", max_input_tokens: 1000000 },
+    { id: "claude-future-10", max_input_tokens: 200000 },
+    { id: "claude-future-11", max_input_tokens: 150000 },
     { id: "provider/model", max_input_tokens: 1000 },
     { id: "*", max_input_tokens: 1000 },
   ],
@@ -44,7 +47,11 @@ const ROSTER = {
     claude: [{ id: "claude-sonnet-4-8", label: "Sonnet 4.8", contextWindow: 200000, maxOutput: 64000, effort: ["low", "high"], adaptive: true }],
     zcode: [{ id: "glm-5", contextWindow: 128000, adaptive: false }],
   },
-  models: {},
+  models: {
+    "claude-future-9": { label: "Future 9", contextWindow: 1000000, maxOutput: 128000 },
+    "claude-future-10": { contextWindow: 200000, effort: ["low", " HIGH ", "high", "off", "unsupported", "max"] },
+    "claude-future-11": { adaptive: true },
+  },
 }
 const LIMITS = {
   paid: true,
@@ -365,6 +372,15 @@ async function main() {
   t.eq(providerListed["claude-sonnet-4-8"].limit.context, 200000, "the roster's window")
   t.ok(providerListed["claude-sonnet-4-8"].capabilities.reasoning, "Sonnet reasons")
   t.eq(providerListed["glm-5"].limit.context, 128000, "GLM's window")
+  // a catalog-only model the roster gives a shape gets that shape, rungs the
+  // family doesn't take dropped; one the roster only describes gets nothing
+  // invented; one off the roster keeps the family's ladder
+  t.eq(providerListed["claude-future-9"].name, "Future 9", "a metadata-only roster entry still names the model")
+  t.ok(!providerListed["claude-future-9"].capabilities.reasoning, "a metadata-only roster entry invents no reasoning")
+  t.eq(JSON.stringify(Object.keys(providerListed["claude-future-9"].variants)), "[]", "a metadata-only roster entry lists no variants")
+  t.eq(JSON.stringify(Object.keys(providerListed["claude-future-10"].variants)), JSON.stringify(["low", "high", "max"]), "rungs the family doesn't take are dropped")
+  t.eq(JSON.stringify(Object.keys(providerListed["claude-future-11"].variants)), JSON.stringify(["low", "medium", "high", "xhigh", "max", "ultra"]), "a shape without a ladder takes the family's")
+  t.eq(JSON.stringify(Object.keys(providerListed["gpt-6"].variants)), JSON.stringify(["low", "medium", "high", "xhigh", "max", "ultra"]), "a model off the roster takes the family's ladder")
 
   // ---- the sign-in refreshed near its end
   saved = { ...saved, expires: Date.now() + 60 * 1000 } // inside the 15-minute lead
