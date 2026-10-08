@@ -34,18 +34,23 @@ const MODELS = {
     { id: "claude-haiku-4-5", max_input_tokens: 180000 },
     { id: "gpt-6", max_input_tokens: 260000 },
     { id: "glm-5", max_input_tokens: 120000 },
+    { id: "kimi-code/k3", max_input_tokens: 1048576 },
+    { id: "gemini-3.1-pro-preview", max_input_tokens: 1048576 },
     { id: "claude-future-9", max_input_tokens: 1000000 },
     { id: "claude-future-10", max_input_tokens: 200000 },
     { id: "claude-future-11", max_input_tokens: 150000 },
+    { id: "claude-retired-9", max_input_tokens: 100000 },
     { id: "provider/model", max_input_tokens: 1000 },
     { id: "*", max_input_tokens: 1000 },
   ],
 }
 const ROSTER = {
   version: "1",
+  withdrawn: ["claude-retired-9"],
   agents: {
     claude: [{ id: "claude-sonnet-4-8", label: "Sonnet 4.8", contextWindow: 200000, maxOutput: 64000, effort: ["low", "high"], adaptive: true }],
     zcode: [{ id: "glm-5", contextWindow: 128000, adaptive: false }],
+    kimi: [{ id: "kimi-code/k3", contextWindow: 1048576, effort: ["low", "high", "max"] }],
   },
   models: {
     "claude-future-9": { label: "Future 9", contextWindow: 1000000, maxOutput: 128000 },
@@ -95,7 +100,7 @@ function checkSignature(req, body, devicePublicB6, credential, t) {
   const sig = sealed["x-mirasim-sig"] ?? req.headers["x-mirasim-sig"]
   const client = req.headers["x-mirasim-client"]
   t.ok(id && ts && nonce && sig, "the signature headers are on" + (enc ? " (sealed)" : ""))
-  t.ok(client === "0.0.372", "the client version is reported")
+  t.ok(client === "0.0.403", "the client version is reported")
   // on a sealed request only the client and the envelope are clear
   for (const name of Object.keys(req.headers)) {
     if (enc) {
@@ -206,7 +211,10 @@ const relay = createServer((req, res) => {
     if (req.url === "/v1/messages" && req.method === "POST") {
       if (process.env.E2E_DEBUG) console.error("MSGS HEADERS", JSON.stringify(req.headers), "BODY", body.slice(0, 200))
       const sealed = checkSignature(req, body, devicePublicB6, credential, t)
-      t.ok(sealed["x-mirasim-agent"] === "claude", "the agent is claude for a Claude model")
+      const model = String(JSON.parse(body).model ?? "")
+      if (model.startsWith("gemini-")) t.ok(sealed["x-mirasim-agent"] === "pi", "the agent is pi for a Gemini model")
+      else if (model.startsWith("kimi-")) t.ok(sealed["x-mirasim-agent"] === "kimi", "the agent is kimi for a Kimi model")
+      else t.ok(sealed["x-mirasim-agent"] === "claude", "the agent is claude for a Claude model")
       t.ok(sealed["x-mirasim-session"].startsWith("mirasim_"), "the session is named: " + sealed["x-mirasim-session"])
       t.ok(sealed["x-mirasim-call"], "the call is named")
       t.ok(!(req.headers["anthropic-beta"] ?? "").includes("oauth-2025-04-20"), "the OAuth beta is dropped")
@@ -268,7 +276,7 @@ async function main() {
   await listen(relay)
   process.env.MIRASIM_ADMIN_URL = `http://127.0.0.1:${admin.address().port}`
   process.env.MIRASIM_RELAY_URL = `http://127.0.0.1:${relay.address().port}`
-  process.env.MIRASIM_CLIENT_VERSION = "0.0.372"
+  process.env.MIRASIM_CLIENT_VERSION = "0.0.403"
 
   const mod = await import("./index.mjs")
   const internals = mod._internal
@@ -352,6 +360,34 @@ async function main() {
   t.ok((await res2.text()).includes("hi from responses"), "the responses reply streams through")
   t.eq(state.responseCalls[0].body.reasoning.effort, "low", "minimal folds onto low")
 
+  // ---- a Gemini request: the Messages wire, the relay's "pi" agent, and a
+  // budget-default thinking form (off disables, minimal is the least budget)
+  const resG = await loader.fetch(loader.baseURL + "/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "gemini-3.1-pro-preview", max_tokens: 4096, thinking: { type: "adaptive" }, output_config: { effort: "off" }, messages: [{ role: "user", content: "hi" }] }),
+  })
+  t.eq(resG.status, 200, "the gemini request answers")
+  const gSent = state.messageCalls.at(-1).body
+  t.eq(gSent.thinking.type, "disabled", "gemini's off is the disabled form")
+  t.eq("output_config" in gSent, false, "gemini's off drops the effort")
+  await loader.fetch(loader.baseURL + "/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "gemini-3.1-pro-preview", max_tokens: 4096, output_config: { effort: "minimal" }, messages: [{ role: "user", content: "hi" }] }),
+  })
+  const gMin = state.messageCalls.at(-1).body
+  t.eq(gMin.thinking.type, "enabled", "gemini's minimal is a budget")
+  t.eq(gMin.thinking.budget_tokens, 1024, "gemini's minimal budget")
+
+  // ---- a request selecting Kimi's alias sends the relay's own id
+  await loader.fetch(loader.baseURL + "/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "kimi-k3", messages: [{ role: "user", content: "hi" }] }),
+  })
+  t.eq(state.messageCalls.at(-1).body.model, "kimi-code/k3", "the Kimi alias resolves to the relay id")
+
   // ---- the usage hook
   const u = await plugin.auth.usage(async () => saved)
   t.eq(u.plan, "pro", "the usage names the plan")
@@ -381,6 +417,16 @@ async function main() {
   t.eq(JSON.stringify(Object.keys(providerListed["claude-future-10"].variants)), JSON.stringify(["low", "high", "max"]), "rungs the family doesn't take are dropped")
   t.eq(JSON.stringify(Object.keys(providerListed["claude-future-11"].variants)), JSON.stringify(["low", "medium", "high", "xhigh", "max", "ultra"]), "a shape without a ladder takes the family's")
   t.eq(JSON.stringify(Object.keys(providerListed["gpt-6"].variants)), JSON.stringify(["low", "medium", "high", "xhigh", "max", "ultra"]), "a model off the roster takes the family's ladder")
+  // the relay's own Kimi id is kept and its alias is published beside it; a
+  // withdrawn model is gone; every relay model takes image input
+  t.ok(providerListed["kimi-code/k3"], "the relay's Kimi id is listed")
+  t.eq(providerListed["kimi-code/k3"].api.npm, "@ai-sdk/anthropic", "Kimi on the Anthropic wire")
+  t.ok(providerListed["kimi-k3"], "Kimi's alias is published beside the relay id")
+  t.eq(providerListed["kimi-k3"].api.id, "kimi-k3", "the alias carries its own selector")
+  t.eq(providerListed["gemini-3.1-pro-preview"].api.npm, "@ai-sdk/anthropic", "Gemini on the Messages wire")
+  t.eq(JSON.stringify(Object.keys(providerListed["gemini-3.1-pro-preview"].variants)), JSON.stringify(["off", "minimal", "low", "medium", "high"]), "Gemini's own ladder")
+  t.eq(providerListed["claude-retired-9"], undefined, "a withdrawn model is dropped")
+  t.ok(providerListed["claude-sonnet-4-8"].capabilities.input.image, "every relay model takes image input")
 
   // ---- the sign-in refreshed near its end
   saved = { ...saved, expires: Date.now() + 60 * 1000 } // inside the 15-minute lead

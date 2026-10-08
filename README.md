@@ -6,9 +6,11 @@
 
 - 浏览器登录（GitHub / Google），或邮箱验证码登录
 - 请求按官方桌面客户端的方式签名（Ed25519 设备密钥 + X25519/ChaCha20-Poly1305 密封）
-- 模型列表与 reasoning 档位来自账号自己的 catalog / roster
+- 模型列表与 reasoning 档位来自账号自己的 catalog / roster，并过滤 roster 下架的模型
 - 用量（额度窗口）来自 relay 的 limits 路由
-- Claude/DeepSeek/GLM/Kimi 走 Anthropic Messages，GPT 走 OpenAI Responses
+- Claude/DeepSeek/GLM/Kimi/Gemini 走 Anthropic Messages，GPT 走 OpenAI Responses
+- 所有 relay 模型标注为支持图片输入
+- Kimi 用中继自己的 id `kimi-code/k3`；旧写法 `kimi-k3` 仍可用，转发时改写回 `kimi-code/k3`
 
 ## 安装
 
@@ -24,7 +26,7 @@ magpie plugin add ~/Documents/magpie-mirasim-plugin
 
 ```
 bun test.mjs    # 与 magpie Go 实现的字节级交叉验证（cross-check.json 里的向量）
-bun e2e.mjs     # 假 Mirasim 服务器驱动的端到端测试，167 项
+bun e2e.mjs     # 假 Mirasim 服务器驱动的端到端测试，258 项
 ```
 
 `cross-check.json` 的向量由 magpie 源码仓库里 `internal/mirasim/cross_check_test.go` 生成（`go test ./internal/mirasim -run TestCross`，可用 `MIRASIM_CROSS_FILE` 指回本目录）；协议无改动时无需重新生成。

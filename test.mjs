@@ -31,7 +31,10 @@ eq("sha256hex(meta)", sha256hex("meta"), "ea3bd73e2b506e00527232b3ed743c066da83a
 eq("sha256hex(body)", sha256hex("body"), "230d8358dc8e8890b4c58deeb62912ee2f20357ae92a5cc861b98e68fe31acb5")
 
 // the signed payload, as the Go test built it, and the deterministic
-// Ed25519 signature over it
+// Ed25519 signature over it. The client version is part of the payload, so
+// this literal is the one the vector was generated with; it is not the
+// plugin's current DEFAULT_CLIENT_VERSION (which has since moved on). The
+// vector checks the signing envelope, not the version value.
 const nonce = Buffer.from(Array.from({ length: 12 }, (_, i) => 0xa0 + i))
 eq("nonce text", nonce.toString("base64url"), cross.nonceText)
 const payload = [
@@ -72,7 +75,7 @@ const packed = sealWith(
 eq("sealed header", packed, cross.seal)
 
 // the body normalization, against internal/provider/mirasim_body_test.go
-const { normalizeBody, parseRoster, specOf, thinkingAdaptive, familyOf, agentFor } = await import("./index.mjs").then((m) => m._internal)
+const { normalizeBody, parseRoster, specOf, thinkingAdaptive, familyOf, agentFor, effortSupported, parseModels, upstreamModelID, withoutWithdrawn } = await import("./index.mjs").then((m) => m._internal)
 const json = (o) => JSON.stringify(o)
 
 // a caller asking a token budget of an effort-form model keeps the amount it
@@ -140,5 +143,49 @@ eq("family claude", familyOf("claude-haiku-4-5"), "claude")
 eq("agent messages", agentFor("/v1/messages", json({ model: "glm-4.7" })), "zcode")
 eq("agent responses", agentFor("/v1/responses", "{}"), "codex")
 eq("agent claude", agentFor("/v1/messages/count_tokens", ""), "claude")
+
+// gemini: its own family, the relay's "pi" agent, its own ladder, and a
+// budget-default shape (off is the disabled form, minimal the least budget)
+eq("family gemini", familyOf("gemini-3.1-pro-preview"), "gemini")
+eq("agent gemini", agentFor("/v1/messages", json({ model: "gemini-3.1-pro-preview" })), "pi")
+eq("gemini takes minimal", String(effortSupported("gemini", "minimal")), "true")
+eq("gemini refuses xhigh", String(effortSupported("gemini", "xhigh")), "false")
+{
+  const off = parse(normalizeBody(`{"model":"gemini-3.1-pro-preview","max_tokens":4096,"thinking":{"type":"adaptive"},"output_config":{"effort":"off"}}`, null))
+  eq("gemini off disables thinking", off.thinking.type, "disabled")
+  eq("gemini off drops effort", "output_config" in off, false)
+  const min = parse(normalizeBody(`{"model":"gemini-3.1-pro-preview","max_tokens":4096,"thinking":{"type":"adaptive"},"output_config":{"effort":"minimal"}}`, null))
+  eq("gemini minimal is a budget", min.thinking.type, "enabled")
+  eq("gemini minimal budget", String(min.thinking.budget_tokens), "1024")
+}
+// a non-Claude family named only by its own agent keeps the effort form: no
+// token budget is invented for it
+{
+  const r = parseRoster(`{"version":"1","agents":{"zcode":[{"id":"glm-5","contextWindow":128000}]}}`)
+  eq("non-claude name-only is unknown", String(thinkingAdaptive(r, "glm-5").known), "false")
+  const out = parse(normalizeBody(`{"model":"glm-5","thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`, r))
+  eq("glm keeps the effort", out.output_config.effort, "high")
+  eq("glm invents no budget", "budget_tokens" in (out.thinking ?? {}), false)
+}
+
+// kimi's published alias resolves to the relay's own id
+eq("kimi alias resolves", upstreamModelID("kimi-k3"), "kimi-code/k3")
+eq("kimi id unchanged", upstreamModelID("kimi-code/k3"), "kimi-code/k3")
+// parseModels keeps the relay's namespaced Kimi id, drops a provider's
+{
+  const ids = parseModels({ data: [{ id: "kimi-code/k3" }, { id: "provider/model" }, { id: "gemini-3.1-pro-preview" }] }).map((m) => m.id)
+  eq("kimi relay id kept", String(ids.includes("kimi-code/k3")), "true")
+  eq("namespaced id dropped", String(ids.includes("provider/model")), "false")
+  eq("gemini id kept", String(ids.includes("gemini-3.1-pro-preview")), "true")
+}
+
+// the roster's withdrawn ids are read and applied
+{
+  const r = parseRoster(`{"version":"1","withdrawn":["GLM-5","glm-5"],"agents":{"zcode":[{"id":"glm-5","contextWindow":128000}]}}`)
+  eq("withdrawn parsed and deduped", JSON.stringify(r.withdrawn), JSON.stringify(["glm-5"]))
+  eq("withdrawn dropped", JSON.stringify(withoutWithdrawn([{ id: "glm-5" }, { id: "gpt-6" }], r)), JSON.stringify([{ id: "gpt-6" }]))
+  const only = parseRoster(`{"version":"1","withdrawn":["claude-old-1"]}`)
+  eq("withdrawn-only roster is valid", JSON.stringify(only.withdrawn), JSON.stringify(["claude-old-1"]))
+}
 
 process.exit(failed ? 1 : 0)

@@ -38,7 +38,7 @@ const DEFAULT_ADMIN = "https://auth.mirasim.ai"
 // test's does; an account's own record overrides both.
 const ADMIN = () => (trim(process.env.MIRASIM_ADMIN_URL) || DEFAULT_ADMIN).replace(/\/+$/, "")
 const RELAY = () => (trim(process.env.MIRASIM_RELAY_URL) || DEFAULT_RELAY).replace(/\/+$/, "")
-const DEFAULT_CLIENT_VERSION = "0.0.372"
+const DEFAULT_CLIENT_VERSION = "0.0.403"
 
 const SESSION_PATH = "/v1/device/session"
 const MODELS_PATH = "/v1/models"
@@ -375,18 +375,42 @@ function agentFor(requestPath, body) {
     model = String(JSON.parse(body).model ?? "")
   } catch {}
   const family = familyOf(model.toLowerCase())
+  if (family === "gemini") return "pi"
   return family === "dsh" || family === "zcode" || family === "kimi" ? family : "claude"
 }
 
 // familyOf is the family a model id belongs to, named as the relay names
 // its agents: dsh for DeepSeek, zcode for GLM, kimi for Kimi, codex for
-// GPT, claude for Claude and anything else.
+// GPT, gemini for Gemini, claude for Claude and anything else.
 function familyOf(model) {
   if (model.startsWith("deepseek-")) return "dsh"
   if (model.startsWith("glm-")) return "zcode"
   if (model.startsWith("kimi-")) return "kimi"
   if (model.startsWith("gpt-")) return "codex"
+  if (model.startsWith("gemini-")) return "gemini"
   return "claude"
+}
+
+// selectorAliases maps a selector this plugin published onto the id the
+// relay's own catalog serves. Kimi is the only entry: the relay serves
+// "kimi-code/k3" and earlier releases republished it as "kimi-k3". Asking
+// upstream for the alias would name a model the relay doesn't serve.
+const selectorAliases = { "kimi-k3": "kimi-code/k3" }
+
+// upstreamModelID resolves a published selector to the id the relay serves.
+// A selector without an alias is returned trimmed and unchanged.
+function upstreamModelID(model) {
+  const trimmed = String(model ?? "").trim()
+  return selectorAliases[trimmed.toLowerCase()] ?? trimmed
+}
+
+// selectorAliasesFor lists the extra selectors that resolve to the same relay
+// model as upstreamID, so the model list can publish them beside the real id.
+// The result never contains upstreamID itself.
+function selectorAliasesFor(upstreamID) {
+  const target = String(upstreamID ?? "").toLowerCase().trim()
+  if (!target) return []
+  return Object.keys(selectorAliases).filter((alias) => selectorAliases[alias] === target)
 }
 
 // ---- the tokens ------------------------------------------------------------------
@@ -540,8 +564,10 @@ const relayOf = (a) => (trim(a?.relayUrl) || RELAY()).replace(/\/+$/, "")
 // ---- the account's catalog and roster ---------------------------------------------
 
 // parseModels reads the account's catalog, narrowed the way the official
-// client narrows it: no placeholders, no namespaced ids, and a dated twin
-// dropped when the plain id it duplicates is served beside it.
+// client narrows it: only the relay's own models (a family prefix, no
+// "-paid" variant — so a namespaced "owner/model" is not one, while Kimi's
+// "kimi-code/k3" is), no placeholders, and a dated twin dropped when the
+// plain id it duplicates is served beside it.
 function parseModels(raw) {
   if (typeof raw === "string") {
     try {
@@ -572,7 +598,7 @@ function parseModels(raw) {
   const out = []
   const seen = new Set()
   for (const m of parsed) {
-    if (seen.has(m.id) || RESERVED_IDS.has(m.id) || m.id.includes("/")) continue
+    if (seen.has(m.id) || RESERVED_IDS.has(m.id) || !isExposedModel(m.id)) continue
     if (DATED_SUFFIX.test(m.id) && undated.has(m.id.replace(DATED_SUFFIX, ""))) continue
     seen.add(m.id)
     out.push(m)
@@ -582,6 +608,23 @@ function parseModels(raw) {
 }
 
 const paidVariant = (id) => /-paid$/i.test(trim(id))
+
+// isExposedModel is whether a catalog id is one of the relay's own models:
+// a family prefix, never a "-paid" variant. A namespaced id that carries no
+// family prefix (a provider's "owner/model") is not, while Kimi's own
+// "kimi-code/k3" is.
+function isExposedModel(id) {
+  const s = String(id ?? "").toLowerCase().trim()
+  if (!s || paidVariant(s)) return false
+  return (
+    s.startsWith("claude-") ||
+    s.startsWith("gpt-") ||
+    s.startsWith("deepseek-") ||
+    s.startsWith("glm-") ||
+    s.startsWith("kimi-") ||
+    s.startsWith("gemini-")
+  )
+}
 
 // parseSpec reads one roster entry.
 function parseSpec(entry) {
@@ -623,7 +666,17 @@ function parseRoster(raw) {
   }
   const envelope = raw ?? {}
   if (!trim(envelope.version)) throw new Error("mirasim: invalid model roster")
-  const roster = { agents: {}, models: {} }
+  const roster = { agents: {}, models: {}, withdrawn: [] }
+  // the relay's withdrawn ids: lowercased, trimmed, de-duplicated, kept even
+  // when no agent or model entry is left beside them
+  const withdrawnSeen = new Set()
+  for (const entry of envelope.withdrawn ?? []) {
+    const id = typeof entry === "string" ? entry.toLowerCase().trim() : ""
+    if (id && !withdrawnSeen.has(id)) {
+      roster.withdrawn.push(id)
+      withdrawnSeen.add(id)
+    }
+  }
   const prefix = { claude: "claude-", codex: "gpt-", dsh: "deepseek-", zcode: "glm-", kimi: "kimi-" }
   for (const family of ["claude", "codex", "dsh", "zcode", "kimi"]) {
     const seen = new Set()
@@ -631,7 +684,6 @@ function parseRoster(raw) {
       const spec = parseSpec(entry)
       if (!spec) continue
       spec.id = spec.id.toLowerCase()
-      if (family === "kimi" && spec.id === "kimi-code/k3") spec.id = "kimi-k3"
       if (!spec.id.startsWith(prefix[family]) || seen.has(spec.id) || spec.contextWindow <= 0 || paidVariant(spec.id)) continue
       if (!spec.label) spec.label = spec.id
       seen.add(spec.id)
@@ -645,10 +697,29 @@ function parseRoster(raw) {
     if (!spec) continue
     roster.models[key] = spec
   }
-  if (!Object.keys(roster.agents).length && !Object.keys(roster.models).length) {
+  if (!Object.keys(roster.agents).length && !Object.keys(roster.models).length && !roster.withdrawn.length) {
     throw new Error("mirasim: model roster contains no valid supported models")
   }
   return roster
+}
+
+// withdrawnSet is the roster's withdrawn ids as a lowercase lookup, or null
+// when nothing is withdrawn.
+function withdrawnSet(roster) {
+  const withdrawn = roster?.withdrawn
+  if (!withdrawn?.length) return null
+  return new Set(withdrawn.map((id) => String(id).toLowerCase().trim()))
+}
+
+// withoutWithdrawn drops the models the signed roster withdraws. Both sides
+// are compared lowercased and trimmed. The Go side resolves each id through
+// ParseModel first (stripping a "[1m]" or "(effort)" suffix); this plugin
+// publishes no such selectors, so a plain lowercase match is the same rule
+// here.
+function withoutWithdrawn(models, roster) {
+  const gone = withdrawnSet(roster)
+  if (!gone) return models
+  return models.filter((m) => !gone.has(String(m.id ?? "").toLowerCase().trim()))
 }
 
 // specOf merges model-wide metadata with every family entry naming the
@@ -681,20 +752,21 @@ function specOf(roster, modelID) {
   return spec
 }
 
-// thinkingAdaptive is the roster's answer to which Claude thinking form the
-// model takes: true is the effort form. known is false when the roster
-// carries no shape for it, which leaves the form to the caller's default
-// (the effort form, like every Claude model the relay publishes). An agent
-// entry naming the model speaks for its shape even when it carries no flag.
+// thinkingAdaptive is the roster's answer to which thinking form the model
+// takes: true is the effort form. known is false when the roster carries no
+// shape for it, which leaves the form to the caller's default (the effort
+// form, like every Claude model the relay publishes). An explicit adaptive
+// flag anywhere speaks for the shape; an entry that merely names the model
+// speaks for it only in the claude family, whose absent flag means the
+// adaptive form. A non-Claude family keeps its own effort controls, so a
+// name-only entry there is not a shape.
 function thinkingAdaptive(roster, modelID) {
   const spec = specOf(roster, modelID)
   if (!spec) return { adaptive: false, known: false }
   if (spec.adaptiveSet) return { adaptive: spec.adaptive, known: true }
   const id = String(modelID ?? "").toLowerCase().trim()
-  for (const entries of Object.values(roster.agents ?? {})) {
-    for (const agent of entries) {
-      if (agent.id === id) return { adaptive: agent.adaptive, known: true }
-    }
+  for (const agent of roster.agents?.claude ?? []) {
+    if (agent.id === id) return { adaptive: agent.adaptive, known: true }
   }
   return { adaptive: false, known: false }
 }
@@ -713,6 +785,8 @@ function familyEfforts(family) {
     case "zcode":
     case "kimi":
       return ["low", "high", "max"]
+    case "gemini":
+      return ["off", "minimal", "low", "medium", "high"]
   }
   return []
 }
@@ -752,6 +826,7 @@ function budgetLevel(budget) {
 function effortSupported(family, level) {
   if (family === "dsh") return level === "off" || level === "low" || level === "high" || level === "max"
   if (family === "zcode" || family === "kimi") return level === "low" || level === "high" || level === "max"
+  if (family === "gemini") return level === "off" || level === "minimal" || level === "low" || level === "medium" || level === "high"
   return level === "low" || level === "medium" || level === "high" || level === "xhigh" || level === "max" || level === "ultra"
 }
 
@@ -765,6 +840,9 @@ function acceptsEffort(roster, model, level) {
     case "glm":
     case "kimi":
       ladder = ["low", "high", "max"]
+      break
+    case "gemini":
+      ladder = ["off", "minimal", "low", "medium", "high"]
   }
   const spec = roster ? specOf(roster, model) : null
   if (spec?.effort?.length) ladder = spec.effort
@@ -787,6 +865,23 @@ function normalizeBody(body, roster) {
   if (!o || typeof o !== "object") return body
   const wire = "instructions" in o || ("input" in o && !("messages" in o)) ? "codex" : "claude"
   return JSON.stringify(wire === "codex" ? codexBody(o) : claudeBody(o, roster))
+}
+
+// rewriteUpstreamModel sends the id the relay serves when the caller selected
+// one of this plugin's aliases (Kimi's "kimi-k3" → "kimi-code/k3"); a body
+// that names none is left byte-for-byte.
+function rewriteUpstreamModel(body) {
+  let o
+  try {
+    o = JSON.parse(body)
+  } catch {
+    return body
+  }
+  if (!o || typeof o !== "object" || typeof o.model !== "string") return body
+  const upstream = upstreamModelID(o.model)
+  if (upstream === o.model) return body
+  o.model = upstream
+  return JSON.stringify(o)
 }
 
 // codexBody folds an effort the relay's ladder doesn't carry onto the rung
@@ -814,7 +909,9 @@ function claudeBody(o, roster) {
   const model = String(o.model ?? "").trim().toLowerCase()
   if (!model) return o
   const { adaptive, known } = roster ? thinkingAdaptive(roster, model) : { adaptive: false, known: false }
-  const takesAdaptive = known ? adaptive : true // every Claude model the relay publishes takes the effort form
+  // unknown shape: every Claude model the relay publishes takes the effort
+  // form, Gemini's own Messages integration takes a token budget
+  const takesAdaptive = known ? adaptive : familyOf(model) !== "gemini"
   const thinkingType = String(o.thinking?.type ?? "").trim().toLowerCase()
   const effort = String(o.output_config?.effort ?? "").trim().toLowerCase()
   const budget = Number(o.thinking?.budget_tokens ?? 0)
@@ -824,13 +921,26 @@ function claudeBody(o, roster) {
     if (model.startsWith("deepseek-")) {
       delete o.thinking
       o.output_config = { ...o.output_config, effort: "off" }
+      return o
     }
+    // Gemini's off is the disabled form, with no effort left beside it.
+    if (familyOf(model) === "gemini") return deleteEffort(o)
     return o
   }
   if (thinkingType === "adaptive" || effort !== "") {
     let level = effort
     if (!level) return o // the model thinks as much as it likes
     if (level === "ultra") level = "max"
+    // Gemini's ladder starts below low: off is the disabled form and
+    // minimal is the smallest token budget the relay takes.
+    if (familyOf(model) === "gemini") {
+      if (level === "off") {
+        o.thinking = { ...o.thinking, type: "disabled" }
+        delete o.thinking.budget_tokens
+        return deleteEffort(o)
+      }
+      if (level === "minimal" && !takesAdaptive) return deleteEffort(setBudget(o, 1024))
+    }
     if (!takesAdaptive) {
       const b = levelBudget(level)
       if (!b) return o
@@ -858,6 +968,17 @@ function claudeBody(o, roster) {
     }
     return setBudget(o, budget)
   }
+  return o
+}
+
+// deleteEffort removes the effort control the budget form doesn't take, and
+// drops output_config when nothing else is left in it — as the Go side's
+// deleteClaudeEffort does.
+function deleteEffort(o) {
+  if (!o.output_config || typeof o.output_config !== "object") return o
+  const { effort: _drop, ...rest } = o.output_config
+  if (Object.keys(rest).length) o.output_config = rest
+  else delete o.output_config
   return o
 }
 
@@ -1301,6 +1422,7 @@ export async function MirasimAuthPlugin({ client }) {
       s = stateOf(cred)
       credential = await locked(() => mintCredential(s, cred))
       out = normalizeBody(body, cred.roster ? parseRoster(JSON.parse(cred.roster)) : null)
+      out = rewriteUpstreamModel(out)
       signedHeaders = inferenceHeaders(cred, s.key, credential, s.sessionID, path, out)
     } catch (e) {
       // a stale access token on the mint route fails the request without
@@ -1407,8 +1529,21 @@ export async function MirasimAuthPlugin({ client }) {
         }
         try {
           const { parsed, roster } = await models(cred, true)
-          if (!parsed.length) return provider.models
-          return Object.fromEntries(parsed.map((m) => [m.id, runtimeModel(m, roster)]))
+          const kept = withoutWithdrawn(parsed, roster)
+          if (!kept.length) return provider.models
+          const listed = Object.fromEntries(kept.map((m) => [m.id, runtimeModel(m, roster)]))
+          // the selectors this plugin shipped stay resolvable beside the
+          // relay's own id, carrying the model's metadata (Kimi's "kimi-k3"
+          // beside "kimi-code/k3")
+          for (const [id, model] of Object.entries(listed)) {
+            for (const alias of selectorAliasesFor(id)) {
+              if (!listed[alias]) listed[alias] = { ...model, id: alias, name: alias, api: { ...model.api, id: alias } }
+            }
+          }
+          // withdraw once more, so an alias cannot bring a withdrawn id back
+          const gone = withdrawnSet(roster)
+          if (!gone) return listed
+          return Object.fromEntries(Object.entries(listed).filter(([id]) => !gone.has(id.toLowerCase().trim())))
         } catch {
           return provider.models
         }
@@ -1418,12 +1553,13 @@ export async function MirasimAuthPlugin({ client }) {
 }
 
 // runtimeModel is one catalog entry as OpenCode lists it: on Anthropic's
-// wire for Claude, DeepSeek, GLM and Kimi, OpenAI Responses for GPT, with
-// the reasoning ladder the roster or the family declares. The roster's shape
-// decides: the levels it lists, narrowed onto the rungs the family takes;
-// the family's own when a shape is named without a list; nothing for an
-// entry that only carries metadata, whose form the relay hasn't declared —
-// advertising one would invite a request the relay refuses.
+// wire for Claude, DeepSeek, GLM, Kimi and Gemini, OpenAI Responses for GPT,
+// with the reasoning ladder the roster or the family declares. The roster's
+// shape decides: the levels it lists, narrowed onto the rungs the family
+// takes; the family's own when a shape is named without a list; nothing for
+// an entry that only carries metadata, whose form the relay hasn't declared —
+// advertising one would invite a request the relay refuses. Every relay
+// model takes image input, as the official built-in provider declares.
 function runtimeModel(m, roster) {
   const family = familyOf(String(m.id).toLowerCase())
   const spec = roster ? specOf(roster, m.id) : null
@@ -1444,9 +1580,9 @@ function runtimeModel(m, roster) {
     capabilities: {
       temperature: true,
       reasoning: efforts.length > 0,
-      attachment: false,
+      attachment: true,
       toolcall: true,
-      input: { text: true, image: false, audio: false, video: false, pdf: false },
+      input: { text: true, image: true, audio: false, video: false, pdf: false },
       output: { text: true, image: false, audio: false, video: false, pdf: false },
       interleaved: false,
     },
@@ -1469,6 +1605,8 @@ export const _internal = {
   parseRoster,
   specOf,
   thinkingAdaptive,
+  withoutWithdrawn,
+  upstreamModelID,
   parseLimits,
   normalizeBody,
   familyOf,
