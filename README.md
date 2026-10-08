@@ -32,3 +32,7 @@ bun e2e.mjs     # 假 Mirasim 服务器驱动的端到端测试，258 项
 `cross-check.json` 的向量由 magpie 源码仓库里 `internal/mirasim/cross_check_test.go` 生成（`go test ./internal/mirasim -run TestCross`，可用 `MIRASIM_CROSS_FILE` 指回本目录）；协议无改动时无需重新生成。
 
 协议移植自 magpie 的 `internal/mirasim`（其又移植自 CLIProxyAPI 的 mirasim 支持与 Mirasim 桌面客户端）。
+
+## 许可
+
+[MIT License](LICENSE)。
