@@ -392,10 +392,16 @@ function familyOf(model) {
 }
 
 // selectorAliases maps a selector this plugin published onto the id the
-// relay's own catalog serves. Kimi is the only entry: the relay serves
-// "kimi-code/k3" and earlier releases republished it as "kimi-k3". Asking
-// upstream for the alias would name a model the relay doesn't serve.
-const selectorAliases = { "kimi-k3": "kimi-code/k3" }
+// relay's own catalog serves. The relay serves Kimi as "kimi-k3" (the
+// release before this one published it as "kimi-code/k3") and DeepSeek as
+// "deepseek-flash"; the names beside them are the ones the other providers
+// serve the same models under, so a caller naming one resolves to the id
+// the relay serves (and magpie can group it with the other providers').
+// Asking upstream for an alias would name a model the relay doesn't serve.
+const selectorAliases = {
+  "kimi-code/k3": "kimi-k3",
+  "deepseek-v4.1-flash": "deepseek-flash",
+}
 
 // upstreamModelID resolves a published selector to the id the relay serves.
 // A selector without an alias is returned trimmed and unchanged.
@@ -565,9 +571,10 @@ const relayOf = (a) => (trim(a?.relayUrl) || RELAY()).replace(/\/+$/, "")
 
 // parseModels reads the account's catalog, narrowed the way the official
 // client narrows it: only the relay's own models (a family prefix, no
-// "-paid" variant — so a namespaced "owner/model" is not one, while Kimi's
-// "kimi-code/k3" is), no placeholders, and a dated twin dropped when the
-// plain id it duplicates is served beside it.
+// "-paid" variant — so a namespaced "owner/model" is not one, while a
+// namespaced id that carries a family prefix still is), no placeholders,
+// and a dated twin dropped when the plain id it duplicates is served
+// beside it.
 function parseModels(raw) {
   if (typeof raw === "string") {
     try {
@@ -611,8 +618,7 @@ const paidVariant = (id) => /-paid$/i.test(trim(id))
 
 // isExposedModel is whether a catalog id is one of the relay's own models:
 // a family prefix, never a "-paid" variant. A namespaced id that carries no
-// family prefix (a provider's "owner/model") is not, while Kimi's own
-// "kimi-code/k3" is.
+// family prefix (a provider's "owner/model") is not, while one that does is.
 function isExposedModel(id) {
   const s = String(id ?? "").toLowerCase().trim()
   if (!s || paidVariant(s)) return false
@@ -868,8 +874,9 @@ function normalizeBody(body, roster) {
 }
 
 // rewriteUpstreamModel sends the id the relay serves when the caller selected
-// one of this plugin's aliases (Kimi's "kimi-k3" → "kimi-code/k3"); a body
-// that names none is left byte-for-byte.
+// one of this plugin's aliases (Kimi's "kimi-code/k3" → "kimi-k3", DeepSeek's
+// "deepseek-v4.1-flash" → "deepseek-flash"); a body that names none is left
+// byte-for-byte.
 function rewriteUpstreamModel(body) {
   let o
   try {
@@ -1533,8 +1540,9 @@ export async function MirasimAuthPlugin({ client }) {
           if (!kept.length) return provider.models
           const listed = Object.fromEntries(kept.map((m) => [m.id, runtimeModel(m, roster)]))
           // the selectors this plugin shipped stay resolvable beside the
-          // relay's own id, carrying the model's metadata (Kimi's "kimi-k3"
-          // beside "kimi-code/k3")
+          // relay's own id, carrying the model's metadata (Kimi's
+          // "kimi-code/k3" beside "kimi-k3", DeepSeek's "deepseek-v4.1-flash"
+          // beside "deepseek-flash")
           for (const [id, model] of Object.entries(listed)) {
             for (const alias of selectorAliasesFor(id)) {
               if (!listed[alias]) listed[alias] = { ...model, id: alias, name: alias, api: { ...model.api, id: alias } }

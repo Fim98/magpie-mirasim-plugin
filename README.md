@@ -10,7 +10,8 @@
 - 用量（额度窗口）来自 relay 的 limits 路由
 - Claude/DeepSeek/GLM/Kimi/Gemini 走 Anthropic Messages，GPT 走 OpenAI Responses
 - 所有 relay 模型标注为支持图片输入
-- Kimi 用中继自己的 id `kimi-code/k3`；旧写法 `kimi-k3` 仍可用，转发时改写回 `kimi-code/k3`
+- Kimi 用中继自己的 id `kimi-k3`；旧写法 `kimi-code/k3` 仍可用，转发时改写回 `kimi-k3`
+- DeepSeek 用中继自己的 id `deepseek-flash`；另发布 `deepseek-v4.1-flash`（与 aliyun 等同名，便于 magpie 路由分组），转发时改写回 `deepseek-flash`
 
 ## 安装
 

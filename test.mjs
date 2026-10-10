@@ -168,13 +168,17 @@ eq("gemini refuses xhigh", String(effortSupported("gemini", "xhigh")), "false")
   eq("glm invents no budget", "budget_tokens" in (out.thinking ?? {}), false)
 }
 
-// kimi's published alias resolves to the relay's own id
-eq("kimi alias resolves", upstreamModelID("kimi-k3"), "kimi-code/k3")
-eq("kimi id unchanged", upstreamModelID("kimi-code/k3"), "kimi-code/k3")
-// parseModels keeps the relay's namespaced Kimi id, drops a provider's
+// kimi's old selector resolves to the relay's own id
+eq("kimi alias resolves", upstreamModelID("kimi-code/k3"), "kimi-k3")
+eq("kimi id unchanged", upstreamModelID("kimi-k3"), "kimi-k3")
+// deepseek's group name resolves to the relay's own id
+eq("deepseek alias resolves", upstreamModelID("deepseek-v4.1-flash"), "deepseek-flash")
+eq("deepseek id unchanged", upstreamModelID("deepseek-flash"), "deepseek-flash")
+// parseModels keeps a namespaced id that carries a family prefix, drops a
+// provider's
 {
   const ids = parseModels({ data: [{ id: "kimi-code/k3" }, { id: "provider/model" }, { id: "gemini-3.1-pro-preview" }] }).map((m) => m.id)
-  eq("kimi relay id kept", String(ids.includes("kimi-code/k3")), "true")
+  eq("namespaced family id kept", String(ids.includes("kimi-code/k3")), "true")
   eq("namespaced id dropped", String(ids.includes("provider/model")), "false")
   eq("gemini id kept", String(ids.includes("gemini-3.1-pro-preview")), "true")
 }

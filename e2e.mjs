@@ -34,7 +34,8 @@ const MODELS = {
     { id: "claude-haiku-4-5", max_input_tokens: 180000 },
     { id: "gpt-6", max_input_tokens: 260000 },
     { id: "glm-5", max_input_tokens: 120000 },
-    { id: "kimi-code/k3", max_input_tokens: 1048576 },
+    { id: "deepseek-flash", max_input_tokens: 1000000 },
+    { id: "kimi-k3", max_input_tokens: 1048576 },
     { id: "gemini-3.1-pro-preview", max_input_tokens: 1048576 },
     { id: "claude-future-9", max_input_tokens: 1000000 },
     { id: "claude-future-10", max_input_tokens: 200000 },
@@ -50,7 +51,7 @@ const ROSTER = {
   agents: {
     claude: [{ id: "claude-sonnet-4-8", label: "Sonnet 4.8", contextWindow: 200000, maxOutput: 64000, effort: ["low", "high"], adaptive: true }],
     zcode: [{ id: "glm-5", contextWindow: 128000, adaptive: false }],
-    kimi: [{ id: "kimi-code/k3", contextWindow: 1048576, effort: ["low", "high", "max"] }],
+    kimi: [{ id: "kimi-k3", contextWindow: 1048576, effort: ["low", "high", "max"] }],
   },
   models: {
     "claude-future-9": { label: "Future 9", contextWindow: 1000000, maxOutput: 128000 },
@@ -214,6 +215,7 @@ const relay = createServer((req, res) => {
       const model = String(JSON.parse(body).model ?? "")
       if (model.startsWith("gemini-")) t.ok(sealed["x-mirasim-agent"] === "pi", "the agent is pi for a Gemini model")
       else if (model.startsWith("kimi-")) t.ok(sealed["x-mirasim-agent"] === "kimi", "the agent is kimi for a Kimi model")
+      else if (model.startsWith("deepseek-")) t.ok(sealed["x-mirasim-agent"] === "dsh", "the agent is dsh for a DeepSeek model")
       else t.ok(sealed["x-mirasim-agent"] === "claude", "the agent is claude for a Claude model")
       t.ok(sealed["x-mirasim-session"].startsWith("mirasim_"), "the session is named: " + sealed["x-mirasim-session"])
       t.ok(sealed["x-mirasim-call"], "the call is named")
@@ -380,13 +382,21 @@ async function main() {
   t.eq(gMin.thinking.type, "enabled", "gemini's minimal is a budget")
   t.eq(gMin.thinking.budget_tokens, 1024, "gemini's minimal budget")
 
-  // ---- a request selecting Kimi's alias sends the relay's own id
+  // ---- a request selecting Kimi's old selector sends the relay's own id
   await loader.fetch(loader.baseURL + "/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "kimi-k3", messages: [{ role: "user", content: "hi" }] }),
+    body: JSON.stringify({ model: "kimi-code/k3", messages: [{ role: "user", content: "hi" }] }),
   })
-  t.eq(state.messageCalls.at(-1).body.model, "kimi-code/k3", "the Kimi alias resolves to the relay id")
+  t.eq(state.messageCalls.at(-1).body.model, "kimi-k3", "Kimi's old selector resolves to the relay id")
+
+  // ---- a request naming DeepSeek's group name sends the relay's own id
+  await loader.fetch(loader.baseURL + "/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }] }),
+  })
+  t.eq(state.messageCalls.at(-1).body.model, "deepseek-flash", "DeepSeek's group name resolves to the relay id")
 
   // ---- the usage hook
   const u = await plugin.auth.usage(async () => saved)
@@ -417,12 +427,15 @@ async function main() {
   t.eq(JSON.stringify(Object.keys(providerListed["claude-future-10"].variants)), JSON.stringify(["low", "high", "max"]), "rungs the family doesn't take are dropped")
   t.eq(JSON.stringify(Object.keys(providerListed["claude-future-11"].variants)), JSON.stringify(["low", "medium", "high", "xhigh", "max", "ultra"]), "a shape without a ladder takes the family's")
   t.eq(JSON.stringify(Object.keys(providerListed["gpt-6"].variants)), JSON.stringify(["low", "medium", "high", "xhigh", "max", "ultra"]), "a model off the roster takes the family's ladder")
-  // the relay's own Kimi id is kept and its alias is published beside it; a
-  // withdrawn model is gone; every relay model takes image input
-  t.ok(providerListed["kimi-code/k3"], "the relay's Kimi id is listed")
-  t.eq(providerListed["kimi-code/k3"].api.npm, "@ai-sdk/anthropic", "Kimi on the Anthropic wire")
-  t.ok(providerListed["kimi-k3"], "Kimi's alias is published beside the relay id")
-  t.eq(providerListed["kimi-k3"].api.id, "kimi-k3", "the alias carries its own selector")
+  // the relay's own Kimi id is kept and the old selector is published beside
+  // it; a withdrawn model is gone; every relay model takes image input
+  t.ok(providerListed["kimi-k3"], "the relay's Kimi id is listed")
+  t.eq(providerListed["kimi-k3"].api.npm, "@ai-sdk/anthropic", "Kimi on the Anthropic wire")
+  t.ok(providerListed["kimi-code/k3"], "Kimi's old selector is published beside the relay id")
+  t.eq(providerListed["kimi-code/k3"].api.id, "kimi-code/k3", "the alias carries its own selector")
+  t.ok(providerListed["deepseek-flash"], "the relay's DeepSeek id is listed")
+  t.ok(providerListed["deepseek-v4.1-flash"], "DeepSeek's group name is published beside it")
+  t.eq(providerListed["deepseek-v4.1-flash"].api.id, "deepseek-v4.1-flash", "the DeepSeek alias carries its own selector")
   t.eq(providerListed["gemini-3.1-pro-preview"].api.npm, "@ai-sdk/anthropic", "Gemini on the Messages wire")
   t.eq(JSON.stringify(Object.keys(providerListed["gemini-3.1-pro-preview"].variants)), JSON.stringify(["off", "minimal", "low", "medium", "high"]), "Gemini's own ladder")
   t.eq(providerListed["claude-retired-9"], undefined, "a withdrawn model is dropped")
