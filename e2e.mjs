@@ -23,6 +23,10 @@ const state = {
   responseCalls: [],
   ticketCalls: 0, // requests the relay answered with the ticket as the credential
   accessCalls: 0, // and with the access token itself
+  queueAttempts: 0, // the queued model's refusals and final success
+  queueCalls: [], // the sealed metadata the queued model's attempts carried
+  plainAttempts: 0, // a 503 that is not a queue refusal
+  ticketRefusals: 0, // relay 401s that ask for a fresh device ticket
 }
 
 // who signed in, and what it can call
@@ -30,6 +34,9 @@ const PROFILE = { email: "u@example.com", plan: "pro", plan_exp: Math.floor(Date
 const MODELS = {
   data: [
     { id: "claude-sonnet-4-8", max_input_tokens: 180000 },
+    { id: "claude-queue-503", max_input_tokens: 180000 },
+    { id: "claude-plain-503", max_input_tokens: 180000 },
+    { id: "claude-401-once", max_input_tokens: 180000 },
     { id: "claude-haiku-4-5-20251001", max_input_tokens: 180000 },
     { id: "claude-haiku-4-5", max_input_tokens: 180000 },
     { id: "gpt-6", max_input_tokens: 260000 },
@@ -213,6 +220,26 @@ const relay = createServer((req, res) => {
       if (process.env.E2E_DEBUG) console.error("MSGS HEADERS", JSON.stringify(req.headers), "BODY", body.slice(0, 200))
       const sealed = checkSignature(req, body, devicePublicB6, credential, t)
       const model = String(JSON.parse(body).model ?? "")
+      if (model === "claude-queue-503") {
+        state.queueAttempts++
+        state.queueCalls.push(sealed)
+        if (state.queueAttempts <= 2) {
+          res.writeHead(503, { "Content-Type": "application/json", "X-Router-Queue-Class": "model", "Retry-After": "1" })
+          return res.end('{"error":{"code":"platform_queue_full"}}')
+        }
+      }
+      if (model === "claude-plain-503") {
+        state.plainAttempts++
+        res.writeHead(503, { "Content-Type": "application/json" })
+        return res.end('{"error":{"code":"model_unavailable"}}')
+      }
+      if (model === "claude-401-once") {
+        state.ticketRefusals++
+        if (state.ticketRefusals === 1) {
+          res.writeHead(401, { "Content-Type": "application/json" })
+          return res.end('{"error":"Mirasim relay rejected the current device ticket"}')
+        }
+      }
       if (model.startsWith("gemini-")) t.ok(sealed["x-mirasim-agent"] === "pi", "the agent is pi for a Gemini model")
       else if (model.startsWith("kimi-")) t.ok(sealed["x-mirasim-agent"] === "kimi", "the agent is kimi for a Kimi model")
       else if (model.startsWith("deepseek-")) t.ok(sealed["x-mirasim-agent"] === "dsh", "the agent is dsh for a DeepSeek model")
@@ -454,6 +481,44 @@ async function main() {
   t.eq(state.refreshes, 1, "the refresh token was traded once")
   t.ok(saved !== wasSaved && saved.access === currentAccess, "the record holds the new pair")
   t.ok(saved.expires > Date.now() + 3000 * 1000, "the new end is an hour out")
+
+  // ---- the relay's queue refusal is waited out and resubmitted: each attempt
+  // is freshly signed (a new call id), the body is the same, the ticket is
+  // reused
+  const beforeQueueMints = state.sessionMints
+  const resQ = await loader.fetch(loader.baseURL + "/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "claude-queue-503", messages: [{ role: "user", content: "hi" }] }),
+  })
+  t.eq(resQ.status, 200, "the queued request finally answers")
+  t.ok((await resQ.text()).includes("hi from fake mirasim"), "the queued reply streams through")
+  t.eq(state.queueAttempts, 3, "two queue refusals then the answer")
+  t.eq(state.queueCalls.length, 3, "every attempt was signed")
+  t.ok(state.queueCalls[0]["x-mirasim-call"] !== state.queueCalls[1]["x-mirasim-call"], "the retry signs a new call")
+  t.ok(state.queueCalls[1]["x-mirasim-call"] !== state.queueCalls[2]["x-mirasim-call"], "the second retry signs a new call")
+  t.eq(state.sessionMints, beforeQueueMints, "a queue retry reuses the ticket")
+
+  // ---- a 503 that is not the relay's queue signal is returned unretried
+  const resP = await loader.fetch(loader.baseURL + "/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "claude-plain-503", messages: [{ role: "user", content: "hi" }] }),
+  })
+  t.eq(resP.status, 503, "an ordinary 503 is returned")
+  t.ok((await resP.text()).includes("model_unavailable"), "its body is preserved")
+  t.eq(state.plainAttempts, 1, "an ordinary 503 is not retried")
+
+  // ---- a relay 401 invalidates the ticket and retries under a fresh one
+  const before401Mints = state.sessionMints
+  const res4 = await loader.fetch(loader.baseURL + "/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "claude-401-once", messages: [{ role: "user", content: "hi" }] }),
+  })
+  t.eq(res4.status, 200, "a relay 401 is retried under a fresh ticket")
+  t.eq(state.ticketRefusals, 2, "the ticket was refused only once")
+  t.eq(state.sessionMints, before401Mints + 1, "the 401 retry minted a new ticket")
 
   // ---- an expired refresh marks the sign-in
   saved = { ...saved, refresh: "spent", expires: Date.now() - 1000 }

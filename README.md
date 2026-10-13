@@ -12,6 +12,7 @@
 - 所有 relay 模型标注为支持图片输入
 - Kimi 用中继自己的 id `kimi-k3`；旧写法 `kimi-code/k3` 仍可用，转发时改写回 `kimi-k3`
 - DeepSeek 用中继自己的 id `deepseek-flash`；另发布 `deepseek-v4.1-flash`（与 aliyun 等同名，便于 magpie 路由分组），转发时改写回 `deepseek-flash`
+- 中继以 503 明确表示「排队未开始」时自动等待后重发（间隔取 `Retry-After`，1–60 秒，缺省 5 秒，单次最多约 4 分钟，调用方取消即停止）；中继以 401 拒绝旧 ticket 时换新 ticket 重发一次
 
 ## 安装
 
@@ -26,11 +27,15 @@ magpie plugin add ~/Documents/magpie-mirasim-plugin
 ## 测试
 
 ```
-bun test.mjs    # 与 magpie Go 实现的字节级交叉验证（cross-check.json 里的向量）
-bun e2e.mjs     # 假 Mirasim 服务器驱动的端到端测试，258 项
+node test.mjs    # 与 magpie Go 实现的字节级交叉验证（cross-check.json 里的向量）
+node e2e.mjs     # 假 Mirasim 服务器驱动的端到端测试，392 项
 ```
 
+（本机装了 bun 时用 `bun` 也行；两个脚本只用标准 Web API 与 node: 内置模块。）
+
 `cross-check.json` 的向量由 magpie 源码仓库里 `internal/mirasim/cross_check_test.go` 生成（`go test ./internal/mirasim -run TestCross`，可用 `MIRASIM_CROSS_FILE` 指回本目录）；协议无改动时无需重新生成。
+
+与上游参考仓库（`~/Documents/cpa-plugin-mirasim`）的同步记录见 [UPSTREAM.md](UPSTREAM.md)：哪次同步到哪个 commit、哪些改动适用、哪些刻意跳过，都在那里。
 
 协议移植自 magpie 的 `internal/mirasim`（其又移植自 CLIProxyAPI 的 mirasim 支持与 Mirasim 桌面客户端）。
 

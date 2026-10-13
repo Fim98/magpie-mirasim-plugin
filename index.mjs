@@ -69,6 +69,17 @@ const ABSENT_QUIET = 60 * 1000
 const UNMINTABLE_QUIET = 15 * 60 * 1000
 const ASK_TIMEOUT = 30 * 1000
 
+// The relay answers a model call it has not started with an explicit queue
+// refusal; upstream (cpa-plugin-mirasim d43ef3f) resubmits those, waiting
+// between attempts. The budget belongs to one request, never the account.
+const QUEUE_WAIT_LIMIT = 4 * 60 * 1000
+const QUEUE_RETRY_DEFAULT = 5 * 1000
+const QUEUE_RETRY_MIN = 1000
+const QUEUE_RETRY_MAX = 60 * 1000
+const MAX_ERROR_BODY = 1 << 20
+// A second relay 401 inside this floor stands instead of minting again.
+const TICKET_REFUSAL_FLOOR = 30 * 1000
+
 const DAY = 24 * 60 * 60 * 1000
 const DATED_SUFFIX = /-20\d{6}$/
 const EMAIL = /^[^@\s]+@[^@\s.]+(\.[^@\s.]+)+$/
@@ -1247,6 +1258,7 @@ function stateOf(a) {
       ticketExpiry: 0,
       ticketRetryAt: 0,
       ticketFails: 0,
+      ticketRefusedUntil: 0,
       unmintableUntil: 0,
     }
     states.set(a.deviceKey, s)
@@ -1326,6 +1338,105 @@ function signed(res, renewed) {
   const headers = new Headers(res.headers)
   headers.set("X-Magpie-Sign-In", said)
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers })
+}
+
+// ---- relay queue refusals ----------------------------------------------------------
+
+// queueModelCall is whether the route can answer with the relay's explicit
+// "not started, queued" signal. Only the model routes may be resubmitted;
+// a descriptive route's failure stays with the caller.
+function queueModelCall(path) {
+  const p = path.replace(/\/+$/, "")
+  return p === "/v1/messages" || p === "/v1/responses"
+}
+
+// queueRefused is the relay saying the call was not started because its slot
+// is full: the X-Router-Queue-Class header, or a platform_queue_full code.
+// It is the only answer safe to resubmit; other 503s are returned as they came.
+function queueRefused(status, headers, body) {
+  if (status !== 503 || body.length > MAX_ERROR_BODY) return false
+  if (headers.get("x-router-queue-class")) return true
+  try {
+    const payload = JSON.parse(body.toString("utf8"))
+    return payload?.error?.code === "platform_queue_full" || payload?.code === "platform_queue_full"
+  } catch {
+    return false
+  }
+}
+
+// queueRetryDelay mirrors the official client's numeric Retry-After handling:
+// seconds clamped to [1, 60], five seconds when the relay names none.
+function queueRetryDelay(headers) {
+  const seconds = Number.parseFloat(trim(headers.get("retry-after")))
+  if (!Number.isFinite(seconds) || seconds <= 0) return QUEUE_RETRY_DEFAULT
+  return Math.floor(Math.max(1, Math.min(60, seconds)) * 1000)
+}
+
+// queueHold tracks one request's wait budget, so a long queue cannot hold a
+// caller forever; once passed, the last refusal is what the caller sees.
+function queueHold(state, now, delay) {
+  if (!state.heldSince) state.heldSince = now
+  return now - state.heldSince + delay <= QUEUE_WAIT_LIMIT
+}
+
+// waitQueueRetry waits between queue attempts, and gives up the moment the
+// caller's request is cancelled; other requests are untouched.
+function waitQueueRetry(delay, signal) {
+  return new Promise((resolve, reject) => {
+    let timer
+    const abort = () => {
+      clearTimeout(timer)
+      reject(signal?.reason ?? new Error("Mirasim: the request was cancelled while queued"))
+    }
+    if (signal?.aborted) return abort()
+    timer = setTimeout(() => {
+      signal?.removeEventListener("abort", abort)
+      resolve()
+    }, delay)
+    signal?.addEventListener("abort", abort, { once: true })
+  })
+}
+
+// peekQueueBody reads a 503 body up to the guard, from a clone, so the
+// original response is untouched when it has to be handed back. Past the
+// guard the body is no longer a small refusal and is left alone.
+async function peekQueueBody(res) {
+  const clone = res.clone()
+  const reader = clone.body?.getReader()
+  if (!reader) return { body: Buffer.alloc(0), overflow: false }
+  const chunks = []
+  let size = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) return { body: Buffer.concat(chunks), overflow: false }
+    chunks.push(Buffer.from(value))
+    size += value.length
+    if (size > MAX_ERROR_BODY) {
+      await reader.cancel().catch(() => {})
+      return { body: Buffer.concat(chunks), overflow: true }
+    }
+  }
+}
+
+// replayResponse rebuilds a fully buffered (or small) refusal for the caller.
+// The body is decoded already, so the length and encoding it arrived under no
+// longer describe it.
+function replayResponse(res, body) {
+  const headers = new Headers(res.headers)
+  headers.delete("content-length")
+  headers.delete("content-encoding")
+  return new Response(body, { status: res.status, statusText: res.statusText, headers })
+}
+
+// refuseTicket mirrors the official client's refusal floor: the first relay
+// 401 invalidates the cached ticket so the next attempt mints a new one,
+// while another rejection inside the floor stands without a mint storm.
+function refuseTicket(s, now) {
+  if (now < s.ticketRefusedUntil) return false
+  s.ticketRefusedUntil = now + TICKET_REFUSAL_FLOOR
+  s.ticket = ""
+  s.ticketExpiry = 0
+  return true
 }
 
 // ---- the plugin ---------------------------------------------------------------------
@@ -1421,43 +1532,79 @@ export async function MirasimAuthPlugin({ client }) {
       return signedInError(e)
     }
     const wasRenewed = renewals.has(cred)
-    let s
-    let credential
-    let signedHeaders
-    let out = body
+    const s = stateOf(cred)
+    let out
     try {
-      s = stateOf(cred)
-      credential = await locked(() => mintCredential(s, cred))
       out = normalizeBody(body, cred.roster ? parseRoster(JSON.parse(cred.roster)) : null)
       out = rewriteUpstreamModel(out)
-      signedHeaders = inferenceHeaders(cred, s.key, credential, s.sessionID, path, out)
-    } catch (e) {
-      // a stale access token on the mint route fails the request without
-      // marking the account: the next round refreshes, as the built-in's
-      // refresh-on-use did
-      return errorResponse({
-        status: e instanceof HTTPStatusError && e.status === 401 ? 401 : 502,
-        message: String(e?.message ?? e),
-        signIn: e instanceof SignInGone ? (e.expired ? "expired" : "kept") : e instanceof HTTPStatusError && e.status === 401 ? "kept" : undefined,
-      })
-    }
-    const h = new Headers(init.headers)
-    for (const name of [...h.keys()]) {
-      const lower = name.toLowerCase()
-      if (lower.startsWith("x-mirasim-")) h.delete(name)
-      // the host's AI SDK key headers: the relay would read one as the
-      // user's token and refuse it
-      else if (lower === "x-api-key" || lower === "authorization") h.delete(name)
-    }
-    dropBeta(h, "oauth-2025-04-20")
-    for (const [name, value] of Object.entries(signedHeaders)) h.set(name, value)
-    let res
-    try {
-      res = await fetch(url, { method: init.method ?? "POST", headers: h, body: out, signal: init.signal })
     } catch (e) {
       return errorResponse({ status: 502, message: String(e?.message ?? e) })
     }
-    return signed(res, wasRenewed)
+    // The relay 401s a stale ticket once, and the request is resubmitted
+    // under a new one; a second 401 inside the refusal floor stands. A queue
+    // refusal waits and resubmits under a fresh signature, its budget
+    // belonging to this request alone.
+    let authRetried = false
+    const queue = { heldSince: 0 }
+    for (;;) {
+      let credential
+      let signedHeaders
+      try {
+        credential = await locked(() => mintCredential(s, cred))
+        signedHeaders = inferenceHeaders(cred, s.key, credential, s.sessionID, path, out)
+      } catch (e) {
+        // a stale access token on the mint route fails the request without
+        // marking the account: the next round refreshes, as the built-in's
+        // refresh-on-use did
+        return errorResponse({
+          status: e instanceof HTTPStatusError && e.status === 401 ? 401 : 502,
+          message: String(e?.message ?? e),
+          signIn: e instanceof SignInGone ? (e.expired ? "expired" : "kept") : e instanceof HTTPStatusError && e.status === 401 ? "kept" : undefined,
+        })
+      }
+      const h = new Headers(init.headers)
+      for (const name of [...h.keys()]) {
+        const lower = name.toLowerCase()
+        if (lower.startsWith("x-mirasim-")) h.delete(name)
+        // the host's AI SDK key headers: the relay would read one as the
+        // user's token and refuse it
+        else if (lower === "x-api-key" || lower === "authorization") h.delete(name)
+      }
+      dropBeta(h, "oauth-2025-04-20")
+      for (const [name, value] of Object.entries(signedHeaders)) h.set(name, value)
+      let res
+      try {
+        res = await fetch(url, { method: init.method ?? "POST", headers: h, body: out, signal: init.signal })
+      } catch (e) {
+        return errorResponse({ status: 502, message: String(e?.message ?? e) })
+      }
+      if (res.status === 401) {
+        if (authRetried || !(await locked(() => refuseTicket(s, Date.now())))) return signed(res, wasRenewed)
+        authRetried = true
+        await res.body?.cancel().catch(() => {})
+        continue
+      }
+      if (queueModelCall(path) && res.status === 503) {
+        const peek = await peekQueueBody(res)
+        if (!peek.overflow && queueRefused(res.status, res.headers, peek.body)) {
+          const delay = queueRetryDelay(res.headers)
+          if (queueHold(queue, Date.now(), delay)) {
+            try {
+              await waitQueueRetry(delay, init.signal)
+            } catch (e) {
+              await res.body?.cancel().catch(() => {})
+              return errorResponse({ status: 502, message: String(e?.message ?? e) })
+            }
+            await res.body?.cancel().catch(() => {})
+            continue
+          }
+        }
+        if (peek.overflow) return signed(res, wasRenewed)
+        await res.body?.cancel().catch(() => {})
+        return signed(replayResponse(res, peek.body), wasRenewed)
+      }
+      return signed(res, wasRenewed)
+    }
   }
 
   return {
@@ -1627,4 +1774,8 @@ export const _internal = {
   withTokens,
   expiryOf,
   newDeviceKey,
+  queueModelCall,
+  queueRefused,
+  queueRetryDelay,
+  waitQueueRetry,
 }

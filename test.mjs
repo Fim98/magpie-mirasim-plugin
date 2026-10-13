@@ -192,4 +192,43 @@ eq("deepseek id unchanged", upstreamModelID("deepseek-flash"), "deepseek-flash")
   eq("withdrawn-only roster is valid", JSON.stringify(only.withdrawn), JSON.stringify(["claude-old-1"]))
 }
 
+// the relay's queue refusal is the only answer safe to resubmit, its delay
+// the official client's numeric Retry-After clamped and defaulted
+{
+  const { queueModelCall, queueRefused, queueRetryDelay } = await import("./index.mjs").then((m) => m._internal)
+  const H = (o = {}) => new Headers(o)
+  eq("queue route messages", String(queueModelCall("/v1/messages")), "true")
+  eq("queue route responses", String(queueModelCall("/v1/responses")), "true")
+  eq("queue route trailing slash", String(queueModelCall("/v1/messages/")), "true")
+  eq("queue route catalog", String(queueModelCall("/v1/models")), "false")
+  eq("queue route count_tokens", String(queueModelCall("/v1/messages/count_tokens")), "false")
+  eq("queue header refusal", String(queueRefused(503, H({ "X-Router-Queue-Class": "model" }), Buffer.from("{}"))), "true")
+  eq("queue body refusal", String(queueRefused(503, H(), Buffer.from('{"error":{"code":"platform_queue_full"}}'))), "true")
+  eq("queue top-level code refusal", String(queueRefused(503, H(), Buffer.from('{"code":"platform_queue_full"}'))), "true")
+  eq("queue ordinary 503", String(queueRefused(503, H(), Buffer.from('{"error":{"code":"model_unavailable"}}'))), "false")
+  eq("queue invalid body", String(queueRefused(503, H(), Buffer.from("invalid"))), "false")
+  eq("queue 200 with header", String(queueRefused(200, H({ "X-Router-Queue-Class": "model" }), Buffer.from("{}"))), "false")
+  eq("queue delay default", String(queueRetryDelay(H())), "5000")
+  eq("queue delay garbage", String(queueRetryDelay(H({ "Retry-After": "garbage" }))), "5000")
+  eq("queue delay zero", String(queueRetryDelay(H({ "Retry-After": "0" }))), "5000")
+  eq("queue delay floor", String(queueRetryDelay(H({ "Retry-After": "0.25" }))), "1000")
+  eq("queue delay trimmed", String(queueRetryDelay(H({ "Retry-After": " 17 " }))), "17000")
+  eq("queue delay fraction", String(queueRetryDelay(H({ "Retry-After": "1.5" }))), "1500")
+  eq("queue delay ceiling", String(queueRetryDelay(H({ "Retry-After": "90" }))), "60000")
+  eq("queue delay infinity", String(queueRetryDelay(H({ "Retry-After": "Infinity" }))), "5000")
+}
+
+// the wait between attempts resolves on time and gives up on the caller's abort
+{
+  const { waitQueueRetry } = await import("./index.mjs").then((m) => m._internal)
+  eq("queue wait resolves", await waitQueueRetry(1, undefined).then(() => "resolved", () => "rejected"), "resolved")
+  const ac = new AbortController()
+  const pending = waitQueueRetry(60000, ac.signal).then(() => "resolved", () => "rejected")
+  ac.abort()
+  eq("queue wait aborts", await pending, "rejected")
+  const already = new AbortController()
+  already.abort()
+  eq("queue wait sees a pre-aborted signal", await waitQueueRetry(60000, already.signal).then(() => "resolved", () => "rejected"), "rejected")
+}
+
 process.exit(failed ? 1 : 0)
