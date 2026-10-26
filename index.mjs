@@ -38,7 +38,7 @@ const DEFAULT_ADMIN = "https://auth.mirasim.ai"
 // test's does; an account's own record overrides both.
 const ADMIN = () => (trim(process.env.MIRASIM_ADMIN_URL) || DEFAULT_ADMIN).replace(/\/+$/, "")
 const RELAY = () => (trim(process.env.MIRASIM_RELAY_URL) || DEFAULT_RELAY).replace(/\/+$/, "")
-const DEFAULT_CLIENT_VERSION = "0.0.403"
+const DEFAULT_CLIENT_VERSION = "0.0.639"
 
 const SESSION_PATH = "/v1/device/session"
 const MODELS_PATH = "/v1/models"
@@ -342,13 +342,15 @@ function sealWith(ephPublicRaw, ephPriv, recipient, metadata, method, requestPat
 
 // inferenceHeaders signs and seals one inference request (Messages or
 // Responses): the metadata the relay correlates a call by — the session, the
-// agent, the call's own id, the sub-account — goes on, is signed, and is
-// sealed into one header before it leaves.
+// agent, the call's own id, the turn it belongs to, the sub-account — goes
+// on, is signed, and is sealed into one header before it leaves.
 function inferenceHeaders(cred, key, credential, sessionID, requestPath, body) {
+  const turn = uuid()
   const metadata = {
     "x-mirasim-session": sessionID,
     "x-mirasim-agent": agentFor(requestPath, body),
     "x-mirasim-call": uuid(),
+    "x-mirasim-turn": turn,
   }
   const account = agentAccount(cred)
   if (account) metadata["x-mirasim-account"] = account
@@ -356,8 +358,17 @@ function inferenceHeaders(cred, key, credential, sessionID, requestPath, body) {
   if (COLLECT_OFF()) metadata["x-mirasim-collect"] = "off"
   const headers = signatureHeaders(key, "POST", requestPath, credential, metadata, body)
   headers.Authorization = "Bearer " + credential
-  // the metadata headers are sealed into one, as the official client sends
-  // them on the inference routes
+  // one call is one turn here: the client derives a traceparent from its
+  // turn id, and the relay reads the turn as the unit a call belongs to
+  const trace = traceparentOf(turn)
+  if (trace) headers.traceparent = trace
+  return sealEnvelope(headers, "POST", requestPath)
+}
+
+// sealEnvelope folds every x-mirasim-* header into one x-mirasim-enc, as the
+// official client does on every relayed call: the client version and the
+// envelope itself are the only x-mirasim-* left in the clear.
+function sealEnvelope(headers, method, requestPath) {
   const sealMeta = {}
   for (const name of Object.keys(headers)) {
     const lower = name.toLowerCase()
@@ -367,8 +378,17 @@ function inferenceHeaders(cred, key, credential, sessionID, requestPath, body) {
       delete headers[name]
     }
   }
-  if (Object.keys(sealMeta).length) headers["x-mirasim-enc"] = seal(sealMeta, "POST", requestPath)
+  if (Object.keys(sealMeta).length) headers["x-mirasim-enc"] = seal(sealMeta, method, requestPath)
   return headers
+}
+
+// traceparentOf is the W3C traceparent the official client derives from a
+// turn id: the id's own 32 hex as the trace, its last half as the span. An
+// id whose span would be all zeros (a bad UUID) yields none.
+function traceparentOf(turnID) {
+  const hex = String(turnID ?? "").replace(/-/g, "").toLowerCase()
+  if (!/^[0-9a-f]{32}$/.test(hex) || /^0+$/.test(hex.slice(16))) return ""
+  return "00-" + hex + "-" + hex.slice(16) + "-01"
 }
 
 // agentFor is the x-mirasim-agent value one request belongs to, as the
@@ -1748,6 +1768,8 @@ function runtimeModel(m, roster) {
 
 // for tests
 export const _internal = {
+  DEFAULT_CLIENT_VERSION,
+  traceparentOf,
   loadDeviceKey,
   signatureHeaders,
   sealWith,

@@ -108,7 +108,7 @@ function checkSignature(req, body, devicePublicB6, credential, t) {
   const sig = sealed["x-mirasim-sig"] ?? req.headers["x-mirasim-sig"]
   const client = req.headers["x-mirasim-client"]
   t.ok(id && ts && nonce && sig, "the signature headers are on" + (enc ? " (sealed)" : ""))
-  t.ok(client === "0.0.403", "the client version is reported")
+  t.ok(client === "0.0.639", "the client version is reported")
   // on a sealed request only the client and the envelope are clear
   for (const name of Object.keys(req.headers)) {
     if (enc) {
@@ -246,6 +246,9 @@ const relay = createServer((req, res) => {
       else t.ok(sealed["x-mirasim-agent"] === "claude", "the agent is claude for a Claude model")
       t.ok(sealed["x-mirasim-session"].startsWith("mirasim_"), "the session is named: " + sealed["x-mirasim-session"])
       t.ok(sealed["x-mirasim-call"], "the call is named")
+      const turn = String(sealed["x-mirasim-turn"] ?? "").replace(/-/g, "")
+      t.eq(turn.length, 32, "the call names its turn")
+      t.eq(req.headers["traceparent"], "00-" + turn + "-" + turn.slice(16) + "-01", "the traceparent follows the turn")
       t.ok(!(req.headers["anthropic-beta"] ?? "").includes("oauth-2025-04-20"), "the OAuth beta is dropped")
       state.messageCalls.push({ headers: req.headers, body: JSON.parse(body) })
       res.writeHead(200, { "Content-Type": "text/event-stream" })
@@ -305,11 +308,12 @@ async function main() {
   await listen(relay)
   process.env.MIRASIM_ADMIN_URL = `http://127.0.0.1:${admin.address().port}`
   process.env.MIRASIM_RELAY_URL = `http://127.0.0.1:${relay.address().port}`
-  process.env.MIRASIM_CLIENT_VERSION = "0.0.403"
+  process.env.MIRASIM_CLIENT_VERSION = "0.0.639"
 
   const mod = await import("./index.mjs")
   const internals = mod._internal
   e2eInternals.chacha20 = internals.chacha20
+  t.eq(internals.DEFAULT_CLIENT_VERSION, "0.0.639", "the plugin signs as the released desktop client")
 
   // ---- the browser sign-in
   let saved = null

@@ -60,6 +60,17 @@ git show <sha>
 - **401 换 ticket 重试**（`refuseTicket` + `ask` 循环）：中继 401 时清掉缓存的 ticket、重新 mint 后重发一次；30 秒内再次 401 则直接返回，避免 mint 风暴。
 - **未取**：上游让 CPA 的非流式翻译去聚合 SSE（`messagesNonStreamPayload`、`Accept: text/event-stream`）。本插件不翻译，宿主 SDK 直接读中继的原生响应。
 
+## 客户端 0.0.639 复核（2026-10-26）
+
+`/Applications/Mirasim.app`（`@mirasim/desktop` 0.0.639，Electron 44.7.0）逐项对照的结果。结论：签名/密封协议没有换代，登录流程没有实质变化；请求头多出 turn/`traceparent`，客户端版本号该跟着走。对照代码在 `Contents/Resources/server-main.cjs`（中继侧，17 MB 打包），crypto core 是内嵌的 WASM（`cc_sign`/`cc_seal`）。
+
+- **签名与密封仍是 `mrs-sig-v2` / `mrs-seal-v1`**：WASM 里只有这两个版本字符串，规范串仍是 `method\0path\0ts\0nonce\0deviceId\0clientVersion\0credential` + 元数据 + body，元数据在推理路由上封成 `x-mirasim-enc`（`x-mirasim-client` 与 envelope 本身留在明文）。**已取**：`x-mirasim-client` 从 0.0.403 改为 0.0.639。
+- **登录**：`GET /auth/oauth/providers`、`GET {auth}/auth/oauth/{provider}/login?redirect_uri=&state=`、回环端口收 `access_token`/`token` + `refresh_token`、`POST /auth/code` + `POST /auth/verify`、`POST /auth/refresh {refresh_token}`、`GET /auth/me` —— 与插件实现一致（客户端把随机串放在回调**路径** `/callback/<random>` 上，插件用固定路径 + `state` 参数，语义等价）。设备身份仍是本地 `~/.mirasim/device.json` 的 UUID + 独立 Ed25519 密钥，没有设备注册接口。
+- **请求头**：除插件已有的 `x-mirasim-session` / `-agent` / `-call` / `-account` / `-locale` / `-collect` 外，客户端每个被代理的调用还带 **`x-mirasim-turn`**（一轮对话的 id），并由它派生 **`traceparent`**（`00-<32hex>-<后16hex>-01`，非 UUID 则不派生）。**已取**：每次推理生成一个 turn（这里一次调用即一轮）与对应 traceparent。
+- **`x-mirasim-repo` / `x-mirasim-git-head`**：只在 token 的 `tenant` 是 `internal`/`external`（官方/合作方账号）时发送，普通账号不发。**不取**。
+- **描述性路由（models/roster/limits）**：客户端自己取 roster 与 limits 时用的是**不密封**的签名头（`/v1/model-roster` 直连、limits 探针带 `x-mirasim-probe: usage`），与插件现状一致。**不改**。
+- **消耗上报**：客户端**不上报**中继计费的调用。它把调用记进本地账本（`session-usage-YYYY-MM.ndjson`，含 `callId`/`providerCallId`/`viaRelay`/`leg`），再用 `GET {relay}/usage/calls?ids=&from=&to=`（签名，`authorization: Bearer <ticket|access>`）回查中继自己的计费记录来补 token；只有当调用是 `leg === "direct"`（本机自带 key、不经中继）时才把按天聚合的 `{device, mode, from?, days:[{day,input,output,cacheRead,cacheWrite,calls,models,agents}]}` `POST {site}/api/leaderboard/usage`（还需先 `/join`，可 `/sync` 关掉）。中继计费的调用由中继自己记账，**重复上报反而会对不上账**。本插件没有 direct 调用，所以这里**不取**；需要核对时按客户端同样的读法用 `/usage/calls` 查即可。
+
 ## 测试
 
 `node test.mjs`（签名/密封字节级交叉验证 + 归一化/别名/队列单元用例）

@@ -5,7 +5,7 @@
 仓库：<https://github.com/Fim98/magpie-mirasim-plugin>
 
 - 浏览器登录（GitHub / Google），或邮箱验证码登录
-- 请求按官方桌面客户端的方式签名（Ed25519 设备密钥 + X25519/ChaCha20-Poly1305 密封）
+- 请求按官方桌面客户端（0.0.639）的方式签名（Ed25519 设备密钥 + X25519/ChaCha20-Poly1305 密封），每次推理带上 `x-mirasim-call` 与 `x-mirasim-turn`（并由 turn 派生 `traceparent`），`x-mirasim-client` 报当前客户端版本
 - 模型列表与 reasoning 档位来自账号自己的 catalog / roster，并过滤 roster 下架的模型
 - 用量（额度窗口）来自 relay 的 limits 路由
 - Claude/DeepSeek/GLM/Kimi/Gemini 走 Anthropic Messages，GPT 走 OpenAI Responses
@@ -28,7 +28,7 @@ magpie plugin add ~/Documents/magpie-mirasim-plugin
 
 ```
 node test.mjs    # 与 magpie Go 实现的字节级交叉验证（cross-check.json 里的向量）
-node e2e.mjs     # 假 Mirasim 服务器驱动的端到端测试，392 项
+node e2e.mjs     # 假 Mirasim 服务器驱动的端到端测试，425 项
 ```
 
 （本机装了 bun 时用 `bun` 也行；两个脚本只用标准 Web API 与 node: 内置模块。）
