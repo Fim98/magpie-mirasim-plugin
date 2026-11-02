@@ -30,6 +30,7 @@ import {
   sign as cryptoSign,
 } from "node:crypto"
 import { createServer } from "node:http"
+import { spawn } from "node:child_process"
 
 const ID = "mirasim"
 const DEFAULT_RELAY = "https://relay.mirasim.ai"
@@ -38,7 +39,9 @@ const DEFAULT_ADMIN = "https://auth.mirasim.ai"
 // test's does; an account's own record overrides both.
 const ADMIN = () => (trim(process.env.MIRASIM_ADMIN_URL) || DEFAULT_ADMIN).replace(/\/+$/, "")
 const RELAY = () => (trim(process.env.MIRASIM_RELAY_URL) || DEFAULT_RELAY).replace(/\/+$/, "")
-const DEFAULT_CLIENT_VERSION = "0.0.639"
+// the desktop client this plugin signs as; the relay reads it from the
+// signed canonical string and from x-mirasim-client
+const DEFAULT_CLIENT_VERSION = "0.0.737"
 
 const SESSION_PATH = "/v1/device/session"
 const MODELS_PATH = "/v1/models"
@@ -49,6 +52,7 @@ const AUTH_ME = "/auth/me"
 const AUTH_PROVIDERS = "/auth/oauth/providers"
 const AUTH_CODE = "/auth/code"
 const AUTH_VERIFY = "/auth/verify"
+const AUTH_MFA_POLL = "/auth/mfa/poll"
 
 const SIG_VERSION = "mrs-sig-v2"
 const SEAL_VERSION = "mrs-seal-v1"
@@ -68,6 +72,8 @@ const TICKET_BACKOFF_MAX = 30 * 1000
 const ABSENT_QUIET = 60 * 1000
 const UNMINTABLE_QUIET = 15 * 60 * 1000
 const ASK_TIMEOUT = 30 * 1000
+// one poll of a two-step challenge is a small call, as the client's own is
+const MFA_POLL_TIMEOUT = 10 * 1000
 
 // The relay answers a model call it has not started with an explicit queue
 // refusal; upstream (cpa-plugin-mirasim d43ef3f) resubmits those, waiting
@@ -112,6 +118,16 @@ class SignInGone extends Error {
   constructor(message, expired = false) {
     super(message)
     this.expired = expired
+  }
+}
+
+// MfaRequired is the answer /auth/verify gives an account with two-step
+// verification on (0.0.737's auth): the sign-in is not refused, it waits for
+// the account holder to confirm it on a page, then the ticket is polled.
+class MfaRequired extends Error {
+  constructor(message, challenge) {
+    super(message)
+    this.challenge = challenge
   }
 }
 
@@ -549,8 +565,146 @@ async function emailCode(address) {
   return adminPost(AUTH_CODE, { email: address })
 }
 
+// emailVerify trades the mailed code for a token pair. An account with
+// two-step verification on is answered 403 with code "mfa_required" and a
+// challenge instead: the pair comes from polling that challenge.
 async function emailVerify(address, code) {
-  return adminPost(AUTH_VERIFY, { email: address, code })
+  const res = await fetch(ADMIN() + AUTH_VERIFY, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ email: address, code }),
+    signal: AbortSignal.timeout(ASK_TIMEOUT),
+  })
+  const text = await res.text()
+  if (res.status === 403) {
+    let payload = null
+    try {
+      payload = JSON.parse(text)
+    } catch {}
+    const challenge = parseMfaChallenge(payload)
+    if (challenge) throw new MfaRequired("Mirasim: two-step verification is required", challenge)
+  }
+  if (!res.ok) {
+    const why = text.trim().slice(0, 512)
+    throw new HTTPStatusError(`mirasim: HTTP ${res.status}${why ? ": " + why : ""}`, res.status)
+  }
+  return JSON.parse(text)
+}
+
+// parseMfaChallenge reads the challenge the service hands back when a sign-in
+// wants a passkey confirmation: the ticket it is polled with, the page the
+// account holder confirms on, and how often and how long to ask. The code
+// sits on the body or its detail, as the client reads it.
+function parseMfaChallenge(payload) {
+  if (!payload || typeof payload !== "object") return null
+  const detail = payload.detail && typeof payload.detail === "object" ? payload.detail : {}
+  if (trim(payload.code) !== "mfa_required" && trim(detail.code) !== "mfa_required") return null
+  const mfa = payload.mfa && typeof payload.mfa === "object" ? payload.mfa : detail.mfa && typeof detail.mfa === "object" ? detail.mfa : null
+  const ticket = trim(mfa?.ticket)
+  if (!ticket || ticket.length > 2048 || /[\r\n\0]/.test(ticket)) return null
+  return {
+    ticket,
+    url: confirmURL(mfa?.url),
+    code: trim(mfa?.code).slice(0, 64),
+    expiresIn: bounded(mfa?.expires_in, 300, 10, 900),
+    interval: bounded(mfa?.interval, 2, 1, 10),
+    enroll: mfa?.enroll === true,
+  }
+}
+
+// confirmURL is the page a confirmation opens, kept to the shapes the client
+// takes: http(s), and plain http only on this machine.
+function confirmURL(value) {
+  const raw = trim(value)
+  if (!raw || raw.length > 2048) return ""
+  let url
+  try {
+    url = new URL(raw)
+  } catch {
+    return ""
+  }
+  if (url.username || url.password) return ""
+  if (url.protocol === "https:") return url.toString()
+  if (url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) return url.toString()
+  return ""
+}
+
+// bounded reads a number the service named, held to its own range.
+function bounded(value, fallback, min, max) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(max, Math.max(min, n))
+}
+
+// mfaPoll asks once whether the confirmation has happened; a confirmed one
+// carries the token pair, a pending one says to ask again.
+async function mfaPoll(ticket) {
+  let res
+  try {
+    res = await fetch(ADMIN() + AUTH_MFA_POLL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ ticket }),
+      signal: AbortSignal.timeout(MFA_POLL_TIMEOUT),
+    })
+  } catch {
+    return { status: "retry" }
+  }
+  if (res.status === 429) {
+    const after = Number.parseFloat(trim(res.headers.get("retry-after")))
+    return { status: "retry", afterSec: Number.isFinite(after) && after > 0 ? Math.min(60, after) : 0 }
+  }
+  let body = null
+  try {
+    body = await res.json()
+  } catch {}
+  const status = trim(body?.status)
+  if (status === "pending" || status === "denied" || status === "expired" || status === "done") return { status }
+  if (status !== "confirmed" || res.status < 200 || res.status >= 300) return { status: "retry" }
+  const access = trim(body?.access_token)
+  if (!access) return { status: "retry" }
+  const refresh = trim(body?.refresh_token)
+  return refresh ? { status: "confirmed", access, refresh } : { status: "confirmed", access }
+}
+
+// waitMfa polls a challenge the way the client does: the service's own
+// interval (1–10 s, 2 s when it names none) between asks, its expiry (plus a
+// five second grace) as the deadline, and a refused poll honoured for the
+// Retry-After it named.
+async function waitMfa(challenge) {
+  const interval = bounded(challenge?.interval, 2, 1, 10) * 1000
+  const deadline = Date.now() + bounded(challenge?.expiresIn, 300, 1, 900) * 1000 + 5000
+  let wait = interval
+  for (;;) {
+    const left = deadline - Date.now()
+    if (left <= 0) return { kind: "expired" }
+    await new Promise((r) => setTimeout(r, Math.min(wait, left)))
+    const polled = await mfaPoll(challenge.ticket)
+    if (polled.status === "confirmed") return { kind: "confirmed", access: polled.access, refresh: polled.refresh }
+    if (polled.status === "denied" || polled.status === "expired" || polled.status === "done") return { kind: polled.status }
+    wait = polled.status === "pending" ? interval : Math.max(interval, (polled.afterSec ?? 0) * 1000)
+  }
+}
+
+// openExternal opens the confirmation page the way the client does, so a
+// mailed-code sign-in that asks for a passkey can finish. It is best effort:
+// a machine with no opener gets the URL in the failure message instead.
+function openExternal(url) {
+  if (!url || trim(process.env.MIRASIM_NO_OPEN) === "1") return false
+  const [cmd, args] =
+    process.platform === "darwin"
+      ? ["open", [url]]
+      : process.platform === "win32"
+        ? ["cmd", ["/c", "start", "", url]]
+        : ["xdg-open", [url]]
+  try {
+    const child = spawn(cmd, args, { stdio: "ignore", detached: true })
+    child.on("error", () => {})
+    child.unref()
+    return true
+  } catch {
+    return false
+  }
 }
 
 // ---- the relay's descriptive routes ---------------------------------------------
@@ -1252,6 +1406,26 @@ async function emailSignIn(inputs) {
       try {
         tokens = await emailVerify(address, code)
       } catch (e) {
+        // an account with two-step verification on is not refused: the code
+        // is good, the confirmation is still owed. Open the page it names and
+        // poll the challenge, as the desktop client does.
+        if (e instanceof MfaRequired) {
+          const challenge = e.challenge
+          const page = challenge.url
+          if (!page) {
+            return {
+              type: "failed",
+              error: "Mirasim: two-step verification is on for this account and the challenge named no confirmation page; sign in with the browser method instead",
+            }
+          }
+          openExternal(page)
+          const r = await waitMfa(challenge)
+          if (r.kind !== "confirmed") {
+            return { type: "failed", error: `Mirasim: the two-step confirmation didn't finish (${r.kind}); confirm it at ${page} and sign in again` }
+          }
+          if (!r.refresh) return { type: "failed", error: "Mirasim: the two-step confirmation carried no refresh token; sign in again" }
+          return successWith(r.access, r.refresh)
+        }
         return { type: "failed", error: String(e?.message ?? e) }
       }
       return successWith(tokens.access_token, tokens.refresh_token)
@@ -1785,6 +1959,8 @@ export const _internal = {
   withoutWithdrawn,
   upstreamModelID,
   parseLimits,
+  parseMfaChallenge,
+  waitMfa,
   normalizeBody,
   familyOf,
   agentFor,

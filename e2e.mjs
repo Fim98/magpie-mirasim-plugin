@@ -108,7 +108,7 @@ function checkSignature(req, body, devicePublicB6, credential, t) {
   const sig = sealed["x-mirasim-sig"] ?? req.headers["x-mirasim-sig"]
   const client = req.headers["x-mirasim-client"]
   t.ok(id && ts && nonce && sig, "the signature headers are on" + (enc ? " (sealed)" : ""))
-  t.ok(client === "0.0.639", "the client version is reported")
+  t.ok(client === "0.0.737", "the client version is reported")
   // on a sealed request only the client and the envelope are clear
   for (const name of Object.keys(req.headers)) {
     if (enc) {
@@ -155,8 +155,61 @@ const admin = createServer((req, res) => {
       return json(PROFILE)
     case "/auth/code":
       return json({})
-    case "/auth/verify":
-      return json({ access_token: currentAccess, refresh_token: currentRefresh })
+    case "/auth/verify": {
+      let body = ""
+      req.on("data", (c) => (body += c))
+      return req.on("end", () => {
+        let ask = {}
+        try {
+          ask = JSON.parse(body)
+        } catch {}
+        const address = String(ask.email ?? "")
+        if (address.startsWith("mfa")) {
+          // an account with two-step verification on: the code is good, the
+          // confirmation is still owed
+          state.mfaTicket = "tkt_mfa_" + (state.mfaTickets + 1)
+          state.mfaTickets++
+          state.mfaPolls = 0
+          state.mfaDeny = address.startsWith("mfa-denied@")
+          res.writeHead(403, { "Content-Type": "application/json" })
+          return res.end(
+            JSON.stringify({
+              code: "mfa_required",
+              detail: {
+                code: "mfa_required",
+                mfa: {
+                  ticket: state.mfaTicket,
+                  url: state.mfaDeny ? "https://mirasim.ai/confirm/deny" : "https://mirasim.ai/confirm/abc",
+                  code: "ABC-123",
+                  expires_in: 30,
+                  interval: 1,
+                  enroll: false,
+                },
+              },
+            }),
+          )
+        }
+        return json({ access_token: currentAccess, refresh_token: currentRefresh })
+      })
+    }
+    case "/auth/mfa/poll": {
+      let body = ""
+      req.on("data", (c) => (body += c))
+      return req.on("end", () => {
+        let ask = {}
+        try {
+          ask = JSON.parse(body)
+        } catch {}
+        if (!state.mfaTicket || ask.ticket !== state.mfaTicket) {
+          res.writeHead(400, { "Content-Type": "application/json" })
+          return res.end(JSON.stringify({ error: "bad ticket" }))
+        }
+        state.mfaPolls++
+        if (state.mfaDeny) return json({ status: "denied" })
+        if (state.mfaPolls < 2) return json({ status: "pending" })
+        return json({ status: "confirmed", access_token: currentAccess, refresh_token: currentRefresh })
+      })
+    }
     case "/auth/refresh":
       if ((req.headers["content-type"] ?? "").includes("json")) {
         let body = ""
@@ -308,12 +361,14 @@ async function main() {
   await listen(relay)
   process.env.MIRASIM_ADMIN_URL = `http://127.0.0.1:${admin.address().port}`
   process.env.MIRASIM_RELAY_URL = `http://127.0.0.1:${relay.address().port}`
-  process.env.MIRASIM_CLIENT_VERSION = "0.0.639"
+  process.env.MIRASIM_CLIENT_VERSION = "0.0.737"
+  // a two-step confirmation opens a page; the test must not open one
+  process.env.MIRASIM_NO_OPEN = "1"
 
   const mod = await import("./index.mjs")
   const internals = mod._internal
   e2eInternals.chacha20 = internals.chacha20
-  t.eq(internals.DEFAULT_CLIENT_VERSION, "0.0.639", "the plugin signs as the released desktop client")
+  t.eq(internals.DEFAULT_CLIENT_VERSION, "0.0.737", "the plugin signs as the released desktop client")
 
   // ---- the browser sign-in
   let saved = null
@@ -541,6 +596,19 @@ async function main() {
   t.eq(e.method, "code", "the email method asks for a pasted code")
   const codeResult = await e.callback("123456")
   t.eq(codeResult.type, "success", "the code finishes the sign-in")
+
+  // ---- an account with two-step verification on (desktop 0.0.737's auth)
+  const mfa = await email.authorize({ email: "mfa@example.com" })
+  const mfaResult = await mfa.callback("123456")
+  t.eq(mfaResult.type, "success", "a confirmed two-step sign-in finishes")
+  t.ok(state.mfaPolls >= 2, "the challenge is polled until it confirms")
+  t.eq(mfaResult.refresh, currentRefresh, "the polled pair is what is kept")
+
+  const denied = await email.authorize({ email: "mfa-denied@example.com" })
+  const deniedResult = await denied.callback("123456")
+  t.eq(deniedResult.type, "failed", "a denied two-step sign-in fails")
+  t.ok(String(deniedResult.error).includes("denied"), "the failure says the confirmation was refused")
+  t.ok(String(deniedResult.error).includes("https://mirasim.ai/confirm/deny"), "the failure names the page to confirm on")
 
   console.log(`\n${passed} passed, ${failed} failed`)
   process.exit(failed ? 1 : 0)

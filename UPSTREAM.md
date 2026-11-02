@@ -71,9 +71,23 @@ git show <sha>
 - **描述性路由（models/roster/limits）**：客户端自己取 roster 与 limits 时用的是**不密封**的签名头（`/v1/model-roster` 直连、limits 探针带 `x-mirasim-probe: usage`），与插件现状一致。**不改**。
 - **消耗上报**：客户端**不上报**中继计费的调用。它把调用记进本地账本（`session-usage-YYYY-MM.ndjson`，含 `callId`/`providerCallId`/`viaRelay`/`leg`），再用 `GET {relay}/usage/calls?ids=&from=&to=`（签名，`authorization: Bearer <ticket|access>`）回查中继自己的计费记录来补 token；只有当调用是 `leg === "direct"`（本机自带 key、不经中继）时才把按天聚合的 `{device, mode, from?, days:[{day,input,output,cacheRead,cacheWrite,calls,models,agents}]}` `POST {site}/api/leaderboard/usage`（还需先 `/join`，可 `/sync` 关掉）。中继计费的调用由中继自己记账，**重复上报反而会对不上账**。本插件没有 direct 调用，所以这里**不取**；需要核对时按客户端同样的读法用 `/usage/calls` 查即可。
 
+## 客户端 0.0.737 复核（2026-11-02）
+
+`/Applications/Mirasim.app` 已是 `@mirasim/desktop` **0.0.737**（0.0.639 → 0.0.665 → 0.0.737）。`~/.mirasim/app` 里还留着 0.0.597 与 0.0.665 的 `server-main.cjs`，所以这次是拿真包做本地差分，而不是只读一遍新包。结论：**签名/密封一个字节都没变，中继路由一个都没变；只有登录多了一步两步验证，客户端版本号该跟着走。**
+
+- **签名与密封**：`mrs-sig-v2` / `mrs-seal-v1` 两个版本串、规范串 `method\0path\0ts\0nonce\0deviceId\0clientVersion\0credential`+元数据+body、封包 AAD `mrs-seal-v1\nMETHOD\npath`、`SEAL_PUBKEY`（`HlyNMMeG…Jn4=`）在 0.0.665 与 0.0.737 里逐字相同；crypto core 仍是内嵌 WASM 的 `cc_sign`/`cc_seal`。**已取**：`clientVersion` 与 `x-mirasim-client` 由 0.0.639 改为 **0.0.737**。
+- **设备 ticket**：`POST /v1/device/session {publicKey, deviceId}`（以 access token 作 credential 签名，带 `x-mirasim-client`，不密封）、404/501 视为不可 mint、401 拒绝语义都没变。
+- **登录**：`/auth/oauth/providers`、`/auth/oauth/{provider}/login`、`/auth/code`、`/auth/verify`、`/auth/refresh`、`/auth/me` 不变；**新增两步验证**（0.0.737 才有的 `/auth/mfa/*`）。开启两步验证的账号拿 `/auth/verify` 会得到 **403 + `code: "mfa_required"`**，challenge 在 body 或 `detail` 里：
+  `{ticket, url, code, expires_in(10–900 秒，缺省 300), interval(1–10 秒，缺省 2), enroll}`。客户端打开 `url`，按 `interval` 轮询 `POST {auth}/auth/mfa/poll {ticket}`（无鉴权头，429 按 `Retry-After` 退避），`status` 为 `pending|confirmed|denied|expired|done`，`confirmed` 的那次带 `access_token`（`refresh_token` 可选）。**已取**：`emailVerify` 认得这个 403，插件打开确认页并轮询到 `confirmed` 再落盘；`denied/expired/done/超时` 都在错误里带上确认页地址。浏览器登录（GitHub/Google）不用改：两步验证在网页上完成，回环回调照旧带 token。
+- **`/auth/mfa/status|enroll|passkeys`、`/auth/account-deletion/*`**：账户设置页的功能，本插件不做管理页。**不取**。
+- **新请求头**：`x-mirasim-turn-proof` / `-turn-reference` / `-machine-proof`（机器身份走 `/v2/gateway/*`：模型网关、vault、MCP）、`x-mirasim-git-*`、`x-mirasim-secret-refusal` / `-consumer` / `-target-host` / `-unattended`（网关与 vault）、`x-mirasim-visitor` / `-preview*`（publish）、`x-mirasim-key`（接口令牌）。推理与描述性路由都不带这些。**不取**。
+- **描述性路由未变**：`/v1/models`、`/v1/model-roster`、`/v1/limits` 的请求形状与 `x-mirasim-probe: usage` 一致；limits 的 `windows[].{name,budget,used,reset_at,model_scoped}`、`paid`、`degraded`，roster 的 `withdrawn`/`served`/`effort`/`autoCompactRatio`/`maxOutput`、catalog 的 `max_input_tokens` 字段在 0.0.665→0.0.737 之间没有任何增删。
+- **0.0.665 起就有、但仍与本插件无关**：`/v1/users/me/balance`、`/v1/subscriptions*`、`/v2/gateway/secret(s)`、`/v2/space-network`、`/v2/me/consents`（额度仍读 `/v1/limits`，余额路由没有换成它的理由）。
+- **一个仍未验证的点**：中继是否对 `clientVersion` 设下限只能连真中继才看得出来，包里看不到。0.0.737 之后若真被拒，症状会是签名路由 401/403，换版本号即可定位。
+
 ## 测试
 
 `node test.mjs`（签名/密封字节级交叉验证 + 归一化/别名/队列单元用例）
-`node e2e.mjs`（假 Mirasim 驱动的端到端，含排队重试与 401 重试）
+`node e2e.mjs`（假 Mirasim 驱动的端到端，含排队重试、401 重试与两步验证的确认/拒绝两条路径）
 
 （本机没有 bun 时直接用 node 也可以，两者都只用标准 Web API 与 node: 内置模块。）
