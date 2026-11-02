@@ -252,6 +252,15 @@ const relay = createServer((req, res) => {
   req.on("end", () => {
     const credential = (req.headers.authorization ?? "").replace(/^Bearer /, "")
     if (req.url === "/v1/device/session" && req.method === "POST") {
+      if (state.mintRegionBlocked) {
+        res.writeHead(429, { "Content-Type": "application/json" })
+        return res.end(
+          JSON.stringify({
+            error: { message: "云端中转未在当前网络区域提供服务。/ The cloud route is not served to this network region.", type: "shared_quota_unavailable" },
+            type: "error",
+          }),
+        )
+      }
       const ask = JSON.parse(body)
       devicePublicB6 = ask.publicKey
       state.sessionMints++
@@ -261,6 +270,10 @@ const relay = createServer((req, res) => {
     else if (credential === currentAccess || credential === ADMIN_TOKEN || credential === ADMIN_TOKEN_2) state.accessCalls++
     if (req.url === "/v1/models" && req.method === "GET") {
       checkSignature(req, "", devicePublicB6, credential, t)
+      if (state.modelsRegionBlocked) {
+        res.writeHead(429, { "Content-Type": "application/json" })
+        return res.end(JSON.stringify({ error: { message: "not served to this network region", type: "shared_quota_unavailable" }, type: "error" }))
+      }
       return json(MODELS)
     }
     if (req.url === "/v1/model-roster" && req.method === "GET") {
@@ -430,6 +443,43 @@ async function main() {
   t.ok((state.messageCalls[0].headers["anthropic-beta"] ?? "").includes("context-1m-2025-08-07"), "the other beta stays")
   t.ok(state.ticketCalls >= 1, "the request was sent with the ticket")
 
+  // the relay serves Messages only to the Mirasim client or Claude Code: a
+  // host's own user-agent is renamed, a Claude Code call keeps its own
+  t.ok(
+    String(state.messageCalls[0].headers["user-agent"] ?? "").startsWith("Mirasim/"),
+    "the caller's own user-agent is replaced with the client this plugin signs as",
+  )
+  await loader.fetch(loader.baseURL + "/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": "claude-cli/2.1.4 (external, cli)" },
+    body: JSON.stringify({ model: "claude-sonnet-4-8", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }),
+  })
+  t.eq(
+    state.messageCalls[state.messageCalls.length - 1].headers["user-agent"],
+    "claude-cli/2.1.4 (external, cli)",
+    "a Claude Code call keeps its own user-agent",
+  )
+
+  // a GET through the same fetch: the model list, carrying no body at all
+  const listRes = await loader.fetch(loader.baseURL + "/models", { method: "GET" })
+  t.eq(listRes.status, 200, "a GET through the plugin answers")
+  const listBody = await listRes.json()
+  t.ok(Array.isArray(listBody.data), "the catalog comes back")
+
+  // the relay refusing this network region: the mint's 429 is not turned into
+  // a 502, and the reason says where to look
+  const otherDevice = { ...saved, deviceKey: internals.newDeviceKey() }
+  state.mintRegionBlocked = true
+  const regionLoader = await plugin.auth.loader(async () => otherDevice)
+  const region = await regionLoader.fetch(regionLoader.baseURL + "/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "claude-sonnet-4-8", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }),
+  })
+  t.eq(region.status, 429, "a region refusal keeps the relay's own status")
+  t.ok((await region.text()).includes("network region"), "the answer says the relay isn't served here")
+  state.mintRegionBlocked = false
+
   // a second request within the ticket's life mints nothing
   await loader.fetch(loader.baseURL + "/messages", {
     method: "POST",
@@ -578,6 +628,15 @@ async function main() {
   t.eq(res4.status, 200, "a relay 401 is retried under a fresh ticket")
   t.eq(state.ticketRefusals, 2, "the ticket was refused only once")
   t.eq(state.sessionMints, before401Mints + 1, "the 401 retry minted a new ticket")
+
+  // ---- a refused catalog does not empty the provider
+  state.modelsRegionBlocked = true
+  const fellBack = await plugin.provider.models({ models: {} }, { auth: saved })
+  const fellBackIDs = Object.keys(fellBack)
+  t.ok(fellBackIDs.includes("claude-sonnet-4-8"), "a refused catalog falls back to the list the record keeps")
+  t.ok(fellBackIDs.includes("gpt-6"), "the record's whole catalog is used, not an empty provider")
+  t.eq(fellBack["kimi-k3"].api.id, "kimi-k3", "the fallback keeps the relay's own ids")
+  state.modelsRegionBlocked = false
 
   // ---- an expired refresh marks the sign-in
   saved = { ...saved, refresh: "spent", expires: Date.now() - 1000 }

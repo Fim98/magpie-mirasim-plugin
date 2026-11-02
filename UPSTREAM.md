@@ -85,6 +85,18 @@ git show <sha>
 - **0.0.665 起就有、但仍与本插件无关**：`/v1/users/me/balance`、`/v1/subscriptions*`、`/v2/gateway/secret(s)`、`/v2/space-network`、`/v2/me/consents`（额度仍读 `/v1/limits`，余额路由没有换成它的理由）。
 - **一个仍未验证的点**：中继是否对 `clientVersion` 设下限只能连真中继才看得出来，包里看不到。0.0.737 之后若真被拒，症状会是签名路由 401/403，换版本号即可定位。
 
+## 真中继实测：502 的三层原因（2026-11-02）
+
+用 magpie 里保存的账号（`~/.config/magpie/plugin-auth.json` 的 `mirasim`）直接驱动插件打真中继，把「502」拆成了三层，全部修掉了：
+
+- **网络区域**：直连 `relay.mirasim.ai` 会被回 **429 `shared_quota_unavailable`**（"云端中转未在当前网络区域提供服务"）；经 `http://127.0.0.1:7890`（这台机器上 Mirasim 桌面客户端 `setting.json` 的 `networkProxy`）就是正常中继。magpie 自己的 `settings.json` 里 `proxy` 是 `direct`，所以插件的请求走了直连——这是那次 502 的起点。插件本身没写死代理：magpie 的 host 会把 provider/账号的代理塞给插件用的 `fetch`，把 magpie 的代理换成能到中继的那个即可。
+- **模型列表被清空**：`provider.models` 取 catalog 失败时原来退回 `provider.models`（空），magpie 记下 `models: 0` / `listError: HTTP 429`，路由阶段就直接判「Mirasim has no endpoint configured」并回 502（1 ms，插件一次都没被调用）。**已修**：失败时改用账号记录里留着的上一份 catalog + roster（`fallbackCatalog`），断网/被拒不再等于没有模型。
+- **客户端身份**：`/v1/messages` 只服务两种 user-agent——`Mirasim/<ver>` 与 `claude-cli/<ver>`，其余（`node`、`Bun/x`、`opencode/x`、`mirasim-host/x`）一律 **403 `permission_denied`：this client is not supported; use the mirasim client or Claude Code**。插件原来把宿主的 UA 原样转发，所以 Claude 系模型在 magpie/opencode 里必被拒。**已修**：UA 不是这两种之一时，插件以自己的身份（`Mirasim/<clientVersion>`）署名；Claude Code 自己来的调用保留原 UA。顺带一提，`/v1/responses` 不查 UA。
+- **另外两个真 bug**（同一次实测发现）：`ask()` 对 GET 也会带空 body，undici 直接抛 "Request with GET/HEAD method cannot have body"（模型列表走 GET 就 502）；以及签名里写死 `POST`，GET 请求签的名与实际方法不符（真中继会拒）。**已修**：GET/HEAD 不带 body，签名与密封的 AAD 用真实方法。
+- **不是 bug 的一条**：中继对 Messages 的 body 有自己的校验——`max_tokens` 很小、没有 `system`/`tools`/`metadata` 的"瘦"请求即使 UA 正确也回 400 `bad_request: 请求格式不正确`。真实客户端发的是完整形状，插件的 `normalizeBody` 只做 thinking 形态改写，不改这些字段。
+
+修完后的实测（经 7890，账号 admin@fimzen…）：`GET /v1/models` 200（21 个模型）、`POST /v1/responses`（gpt-6-astra）200 SSE、`POST /v1/messages`（claude-haiku-5-5，完整 body）200 SSE——即 0.0.737 的 `clientVersion` 被中继接受。
+
 ## 测试
 
 `node test.mjs`（签名/密封字节级交叉验证 + 归一化/别名/队列单元用例）

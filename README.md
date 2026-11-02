@@ -12,6 +12,8 @@
 - 所有 relay 模型标注为支持图片输入
 - Kimi 用中继自己的 id `kimi-k3`；旧写法 `kimi-code/k3` 仍可用，转发时改写回 `kimi-k3`
 - DeepSeek 用中继自己的 id `deepseek-flash`；另发布 `deepseek-v4.1-flash`（与 aliyun 等同名，便于 magpie 路由分组），转发时改写回 `deepseek-flash`
+- 中继只把 `/v1/messages` 服务给 Mirasim 客户端和 Claude Code：调用方的 user-agent 是别的（node、Bun、编辑器自己的）时，插件以自己的身份 `Mirasim/<clientVersion>` 署名；Claude Code 的调用保留它自己的 UA
+- 中继按**网络区域**提供服务：直连被拒（429 `shared_quota_unavailable`）时，给 magpie 或这个 provider 配一个能到中继的代理即可（Mirasim 桌面客户端自己就是这么做的）；插件取不到 catalog 时会沿用账号记录里的上一份模型列表，不会把 provider 清空
 - 中继以 503 明确表示「排队未开始」时自动等待后重发（间隔取 `Retry-After`，1–60 秒，缺省 5 秒，单次最多约 4 分钟，调用方取消即停止）；中继以 401 拒绝旧 ticket 时换新 ticket 重发一次
 
 ## 安装

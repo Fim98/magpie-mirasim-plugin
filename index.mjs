@@ -360,7 +360,7 @@ function sealWith(ephPublicRaw, ephPriv, recipient, metadata, method, requestPat
 // Responses): the metadata the relay correlates a call by — the session, the
 // agent, the call's own id, the turn it belongs to, the sub-account — goes
 // on, is signed, and is sealed into one header before it leaves.
-function inferenceHeaders(cred, key, credential, sessionID, requestPath, body) {
+function inferenceHeaders(cred, key, credential, sessionID, method, requestPath, body) {
   const turn = uuid()
   const metadata = {
     "x-mirasim-session": sessionID,
@@ -372,13 +372,17 @@ function inferenceHeaders(cred, key, credential, sessionID, requestPath, body) {
   if (account) metadata["x-mirasim-account"] = account
   if (LOCALE()) metadata["x-mirasim-locale"] = LOCALE()
   if (COLLECT_OFF()) metadata["x-mirasim-collect"] = "off"
-  const headers = signatureHeaders(key, "POST", requestPath, credential, metadata, body)
+  // the method signed is the method sent: a GET (the model list may come
+  // through here) is not a POST, and the relay checks what the signature
+  // says against what arrived
+  const verb = String(method ?? "POST").toUpperCase()
+  const headers = signatureHeaders(key, verb, requestPath, credential, metadata, body)
   headers.Authorization = "Bearer " + credential
   // one call is one turn here: the client derives a traceparent from its
   // turn id, and the relay reads the turn as the unit a call belongs to
   const trace = traceparentOf(turn)
   if (trace) headers.traceparent = trace
-  return sealEnvelope(headers, "POST", requestPath)
+  return sealEnvelope(headers, verb, requestPath)
 }
 
 // sealEnvelope folds every x-mirasim-* header into one x-mirasim-enc, as the
@@ -1523,6 +1527,26 @@ const signedInError = (e) =>
     signIn: e instanceof SignInGone ? (e.expired ? "expired" : "kept") : undefined,
   })
 
+// KNOWN_CLIENT is the user-agent the relay serves a Messages call to: its own
+// client or Claude Code, nothing else. Anything else is answered 403
+// ("this client is not supported"), so a host whose own user-agent is
+// neither is told what this plugin signs as.
+const KNOWN_CLIENT = /^(Mirasim|mirasim)\/|^claude-cli\//
+
+// REGION_REFUSAL is the relay saying the cloud route is not offered where the
+// request came from. It is not an account problem and not a signature one: the
+// machine has to reach the relay on a network it serves, the way the Mirasim
+// app reaches it through its own networkProxy.
+const REGION_REFUSAL = /shared_quota_unavailable|not served to this network region|未在当前网络区域/
+
+function withRegionHint(message) {
+  if (!REGION_REFUSAL.test(message)) return message
+  return (
+    message +
+    " (the relay is not served to this network region: point this provider at a proxy that reaches it, as the Mirasim app's own networkProxy does)"
+  )
+}
+
 // signed is res saying what it means for the sign-in, as the built-in's
 // answer did: a renewed token pair cleared the mark whatever came of the
 // request; without one, a success left the mark as it was.
@@ -1718,6 +1742,7 @@ export async function MirasimAuthPlugin({ client }) {
   const ask = async (url, init, getAuth) => {
     const u = new URL(url)
     const path = u.pathname
+    const method = String(init.method ?? "POST").toUpperCase()
     const body = typeof init.body === "string" ? init.body : ""
     let cred
     try {
@@ -1734,6 +1759,9 @@ export async function MirasimAuthPlugin({ client }) {
     } catch (e) {
       return errorResponse({ status: 502, message: String(e?.message ?? e) })
     }
+    // a GET carries no body: undici refuses one outright ("Request with
+    // GET/HEAD method cannot have body"), and the model list asks with GET
+    const sendBody = method === "GET" || method === "HEAD" ? undefined : out
     // The relay 401s a stale ticket once, and the request is resubmitted
     // under a new one; a second 401 inside the refusal floor stands. A queue
     // refusal waits and resubmits under a fresh signature, its budget
@@ -1745,14 +1773,14 @@ export async function MirasimAuthPlugin({ client }) {
       let signedHeaders
       try {
         credential = await locked(() => mintCredential(s, cred))
-        signedHeaders = inferenceHeaders(cred, s.key, credential, s.sessionID, path, out)
+        signedHeaders = inferenceHeaders(cred, s.key, credential, s.sessionID, method, path, out)
       } catch (e) {
         // a stale access token on the mint route fails the request without
         // marking the account: the next round refreshes, as the built-in's
         // refresh-on-use did
         return errorResponse({
-          status: e instanceof HTTPStatusError && e.status === 401 ? 401 : 502,
-          message: String(e?.message ?? e),
+          status: e instanceof HTTPStatusError && [401, 403, 429].includes(e.status) ? e.status : 502,
+          message: withRegionHint(String(e?.message ?? e)),
           signIn: e instanceof SignInGone ? (e.expired ? "expired" : "kept") : e instanceof HTTPStatusError && e.status === 401 ? "kept" : undefined,
         })
       }
@@ -1766,11 +1794,16 @@ export async function MirasimAuthPlugin({ client }) {
       }
       dropBeta(h, "oauth-2025-04-20")
       for (const [name, value] of Object.entries(signedHeaders)) h.set(name, value)
+      // the relay serves a Messages call only to the Mirasim client or Claude
+      // Code, and a host's own user-agent (node's, Bun's, an editor's) is
+      // neither: the plugin signs as the Mirasim client, so it says so, while
+      // a Claude Code call keeps the name it came with
+      if (!KNOWN_CLIENT.test(trim(h.get("user-agent")))) h.set("user-agent", "Mirasim/" + CLIENT_VERSION())
       let res
       try {
-        res = await fetch(url, { method: init.method ?? "POST", headers: h, body: out, signal: init.signal })
+        res = await fetch(url, { method, headers: h, body: sendBody, signal: init.signal })
       } catch (e) {
-        return errorResponse({ status: 502, message: String(e?.message ?? e) })
+        return errorResponse({ status: 502, message: withRegionHint(String(e?.message ?? e)) })
       }
       if (res.status === 401) {
         if (authRetried || !(await locked(() => refuseTicket(s, Date.now())))) return signed(res, wasRenewed)
@@ -1877,32 +1910,57 @@ export async function MirasimAuthPlugin({ client }) {
         }
         try {
           const { parsed, roster } = await models(cred, true)
-          const kept = withoutWithdrawn(parsed, roster)
-          if (!kept.length) return provider.models
-          const listed = Object.fromEntries(kept.map((m) => [m.id, runtimeModel(m, roster)]))
-          // the selectors this plugin shipped stay resolvable beside the
-          // relay's own id, carrying the model's metadata (Kimi's
-          // "kimi-code/k3" beside "kimi-k3", DeepSeek's "deepseek-v4.1-flash"
-          // beside "deepseek-flash")
-          for (const [id, model] of Object.entries(listed)) {
-            for (const alias of selectorAliasesFor(id)) {
-              if (!listed[alias]) listed[alias] = { ...model, id: alias, name: alias, api: { ...model.api, id: alias } }
-            }
-          }
-          // withdraw once more, so an alias cannot bring a withdrawn id back
-          const gone = withdrawnSet(roster)
-          if (!gone) return listed
-          return Object.fromEntries(Object.entries(listed).filter(([id]) => !gone.has(id.toLowerCase().trim())))
+          return listedCatalog(parsed, roster) ?? fallbackCatalog(provider, auth)
         } catch {
-          return provider.models
+          return fallbackCatalog(provider, auth)
         }
       },
     },
   }
 }
 
-// runtimeModel is one catalog entry as OpenCode lists it: on Anthropic's
-// wire for Claude, DeepSeek, GLM, Kimi and Gemini, OpenAI Responses for GPT,
+// listedCatalog turns one catalog and the roster beside it into the models
+// magpie lists: withdrawn ids dropped, the selectors this plugin shipped
+// published beside the relay's own id carrying the model's metadata (Kimi's
+// "kimi-code/k3" beside "kimi-k3", DeepSeek's "deepseek-v4.1-flash" beside
+// "deepseek-flash"), and the withdrawals applied once more so an alias cannot
+// bring a withdrawn id back. null when nothing survives.
+function listedCatalog(parsed, roster) {
+  const kept = withoutWithdrawn(parsed, roster)
+  if (!kept.length) return null
+  const listed = Object.fromEntries(kept.map((m) => [m.id, runtimeModel(m, roster)]))
+  for (const [id, model] of Object.entries(listed)) {
+    for (const alias of selectorAliasesFor(id)) {
+      if (!listed[alias]) listed[alias] = { ...model, id: alias, name: alias, api: { ...model.api, id: alias } }
+    }
+  }
+  const gone = withdrawnSet(roster)
+  if (!gone) return listed
+  return Object.fromEntries(Object.entries(listed).filter(([id]) => !gone.has(id.toLowerCase().trim())))
+}
+
+// fallbackCatalog is the catalog the account's own record keeps, used when the
+// relay cannot be asked. An empty list is not a cosmetic loss: magpie reads a
+// provider with no models as "no endpoint configured" and refuses every call
+// in its own routing, with a 502, before the plugin's fetch is ever reached.
+function fallbackCatalog(provider, auth) {
+  try {
+    const raw = auth?.models ? JSON.parse(auth.models) : null
+    if (raw) {
+      let roster = null
+      try {
+        roster = auth?.roster ? parseRoster(JSON.parse(auth.roster)) : null
+      } catch {
+        roster = null
+      }
+      const listed = listedCatalog(parseModels(raw), roster)
+      if (listed) return listed
+    }
+  } catch {}
+  return provider.models
+}
+
+// runtimeModel is one catalog entry as OpenCode lists it: on Anthropic's// wire for Claude, DeepSeek, GLM, Kimi and Gemini, OpenAI Responses for GPT,
 // with the reasoning ladder the roster or the family declares. The roster's
 // shape decides: the levels it lists, narrowed onto the rungs the family
 // takes; the family's own when a shape is named without a list; nothing for
