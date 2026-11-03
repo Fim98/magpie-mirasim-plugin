@@ -7,7 +7,7 @@
 - 浏览器登录（GitHub / Google），或邮箱验证码登录；账号开了两步验证时，验证码登录会打开确认页并轮询到确认完成
 - 请求按官方桌面客户端（0.0.737）的方式签名（Ed25519 设备密钥 + X25519/ChaCha20-Poly1305 密封），每次推理带上 `x-mirasim-call` 与 `x-mirasim-turn`（并由 turn 派生 `traceparent`），`x-mirasim-client` 报当前客户端版本
 - 模型列表与 reasoning 档位来自账号自己的 catalog / roster，并过滤 roster 下架的模型
-- 用量（额度窗口）来自 relay 的 limits 路由
+- 用量（额度窗口）来自 relay 的 limits 路由；额度本身（客户端「个人额度」那张卡的数字、明细与到期）来自 `/v1/credits/activity`，两者一起画一张卡：`30d ███ 83.97 / 85.91 · 98% left`。limits 给一个世纪以后的重置时间时（relay 从 2026-10-23 起这么回）只保留用量，不再显示这个倒计时；limits 一条窗口都没有时，只用额度账本画卡
 - Claude/DeepSeek/GLM/Kimi/Gemini 走 Anthropic Messages，GPT 走 OpenAI Responses
 - 所有 relay 模型标注为支持图片输入
 - Kimi 用中继自己的 id `kimi-k3`；旧写法 `kimi-code/k3` 仍可用，转发时改写回 `kimi-k3`

@@ -27,6 +27,8 @@ const state = {
   queueCalls: [], // the sealed metadata the queued model's attempts carried
   plainAttempts: 0, // a 503 that is not a queue refusal
   ticketRefusals: 0, // relay 401s that ask for a fresh device ticket
+  limitsRefused: false, // the allowance read answered with the region refusal
+  creditsRefused: false, // the ledger read answered with a refusal of its own
 }
 
 // who signed in, and what it can call
@@ -66,12 +68,25 @@ const ROSTER = {
     "claude-future-11": { adaptive: true },
   },
 }
-const LIMITS = {
+const LIMITS_NORMAL = {
   paid: true,
   windows: [
     { name: "5h", budget: 100, used: 42.5, reset_at: Math.floor(Date.now() / 1000) + 3600 },
     { name: "7d", budget: 500, used: 300, reset_at: null },
   ],
+}
+// what the relay has answered the 30d window since 2026-10-23: the window's
+// own end plus a century, which the official client shows as-is
+const LIMITS_CENTURY = { paid: false, windows: [{ name: "30d", budget: 8591, used: 193.604149, reset_at: 4945084567 }] }
+let LIMITS = LIMITS_NORMAL
+// the ledger the client's 个人额度 card reads: amounts are hundredths of a 额度
+const CREDITS = {
+  period: { resetAt: null },
+  items: [
+    { id: "grant:1", at: 1792742436218, kind: "grant", credits: 10000, state: "applied", title: "Original", source: { type: "platform" } },
+    { id: "adjust:2", at: 1793260816839, kind: "adjust", credits: -4250, state: "applied", title: "Adjustment", source: { type: "platform" } },
+  ],
+  balance: { remaining: 5750, lots: [{ id: "1", credits: 10000, remaining: 5750, grantedAt: 1792742436218, expiresAt: 1808495999000, kind: "carry" }] },
 }
 
 const sha256hex = (v) => createHash("sha256").update(v ?? "").digest("hex")
@@ -280,7 +295,19 @@ const relay = createServer((req, res) => {
       return json(ROSTER)
     }
     if (req.url === "/v1/limits" && req.method === "GET") {
+      if (state.limitsRefused) {
+        res.writeHead(429, { "Content-Type": "application/json" })
+        return res.end('{"error":{"message":"云端中转未在当前网络区域提供服务。","type":"shared_quota_unavailable"},"type":"error"}')
+      }
       return json(LIMITS)
+    }
+    if (req.url.startsWith("/v1/credits/activity") && req.method === "GET") {
+      t.eq(req.headers.authorization, "Bearer " + currentAccess, "the ledger is read with the account's access token, nothing signed")
+      if (state.creditsRefused) {
+        res.writeHead(403, { "Content-Type": "application/json" })
+        return res.end('{"error":{"code":"token_invalid"}}')
+      }
+      return json(CREDITS)
     }
     if (req.url === "/v1/messages" && req.method === "POST") {
       if (process.env.E2E_DEBUG) console.error("MSGS HEADERS", JSON.stringify(req.headers), "BODY", body.slice(0, 200))
@@ -543,6 +570,53 @@ async function main() {
   t.eq(u.windows[0].used, 42.5, "the 5h percentage")
   t.ok(u.windows[0].resetSecs > 3500, "the reset seconds")
   t.eq(u.signIn, "kept", "a clean read keeps the sign-in")
+
+  // ---- a reset a century out is the relay's "no reset scheduled": the window
+  // keeps its use and loses a countdown nothing can wait for
+  LIMITS = LIMITS_CENTURY
+  const far = await plugin.auth.usage(async () => saved)
+  t.eq(far.windows.length, 1, "the century-out window is still read")
+  t.eq(far.windows[0].name, "30d", "the window keeps its name")
+  t.eq(far.windows[0].used, 2.3, "and its use")
+  t.eq(far.windows[0].resetsAt, undefined, "its century-out reset is dropped")
+  t.eq(far.windows[0].resetSecs, undefined, "and its countdown with it")
+  LIMITS = LIMITS_NORMAL
+
+  // ---- a refused allowance read says what the refusal means, as the calls do
+  state.limitsRefused = true
+  const refused = await plugin.auth.usage(async () => saved)
+  t.ok(/network region/.test(refused.error ?? ""), "the refusal keeps the relay's words")
+  t.ok(/proxy/.test(refused.error ?? ""), "and says to point the provider at one that reaches the relay")
+  t.eq(refused.signIn, "kept", "a refusal is not a lapsed sign-in")
+  state.limitsRefused = false
+
+  // ---- the ledger answers the amount the client's own card shows ("83.97 /
+  // 85.91" in the 个人额度 panel): granted and spent 额度 on the account's
+  // window, and only there
+  const led = await plugin.auth.usage(async () => saved)
+  t.eq(led.windows.length, 2, "both windows are still read")
+  t.eq(led.windows[0].limit, 100, "the ledger's grant is the window's limit")
+  t.eq(led.windows[0].amount, 42.5, "and its spend the window's amount")
+  t.eq(led.windows[1].amount, undefined, "a window the ledger does not describe carries no amounts")
+  t.eq(led.windows[0].resetsAt !== undefined, true, "a real reset still rides along")
+
+  // ---- a ledger that cannot be read leaves the percentage card as it was
+  state.creditsRefused = true
+  const noLedger = await plugin.auth.usage(async () => saved)
+  t.eq(noLedger.windows[0].amount, undefined, "no ledger, no amounts")
+  t.eq(noLedger.windows[0].used, 42.5, "and the percentage is untouched")
+  t.eq(noLedger.error, undefined, "a failed ledger read is not the allowance's failure")
+  state.creditsRefused = false
+
+  // ---- the limits route silent, the ledger alone still draws the card
+  LIMITS = { paid: false, windows: [] }
+  const ledgerOnly = await plugin.auth.usage(async () => saved)
+  t.eq(ledgerOnly.windows.length, 1, "one window from the ledger alone")
+  t.eq(ledgerOnly.windows[0].name, "credits", "named for what it counts")
+  t.eq(ledgerOnly.windows[0].used, 42.5, "the spend is the percentage")
+  t.eq(ledgerOnly.windows[0].limit, 100, "the grant is the limit")
+  t.eq(ledgerOnly.windows[0].amount, 42.5, "the spent part the amount")
+  LIMITS = LIMITS_NORMAL
 
   // ---- the models hook
   const providerListed = await plugin.provider.models({ models: {} }, { auth: saved })

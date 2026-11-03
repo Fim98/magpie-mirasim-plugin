@@ -47,6 +47,7 @@ const SESSION_PATH = "/v1/device/session"
 const MODELS_PATH = "/v1/models"
 const ROSTER_PATH = "/v1/model-roster"
 const LIMITS_PATH = "/v1/limits"
+const CREDITS_PATH = "/v1/credits/activity"
 const AUTH_REFRESH = "/auth/refresh"
 const AUTH_ME = "/auth/me"
 const AUTH_PROVIDERS = "/auth/oauth/providers"
@@ -1235,17 +1236,111 @@ function parseLimits(raw) {
 }
 
 // resetTime reads a reset the way the client does: seconds or milliseconds,
-// or an RFC 3339 moment.
-function resetTime(value) {
+// or an RFC 3339 moment. A moment a year or more out is not a countdown: from
+// 2026-10-23 the relay answers the 30d window with reset_at = 2126-09-29T10:16:07Z
+// (the window's own end plus a century — the same number the official client
+// shows, and the same one it prints as "resets in 3152677006s"), so a card that
+// copied it would read "↻ 2126". The window keeps its use and loses a reset it
+// cannot honour.
+const FAR_RESET_MS = 366 * 24 * 60 * 60 * 1000
+
+// momentOf reads a moment in seconds or milliseconds, as the relay writes them
+// both ways: its limits are seconds, its credit ledger milliseconds.
+function momentOf(value) {
   if (value == null || value === "") return null
   const n = Number(value)
   if (isFinite(n) && n > 0) {
-    const ms = n > 1e12 ? n : n * 1000
-    const d = new Date(ms)
+    const d = new Date(n > 1e12 ? n : n * 1000)
     return isNaN(d) ? null : d
   }
   const d = new Date(String(value))
   return isNaN(d) ? null : d
+}
+
+function resetTime(value) {
+  const d = momentOf(value)
+  if (!d) return null
+  return d.getTime() - Date.now() > FAR_RESET_MS ? null : d
+}
+
+// ---- the credit ledger -------------------------------------------------------------
+
+// parseCredits reads the account's credit ledger, the answer behind the
+// official client's 个人额度 card: what is left, the lots it is made of, each
+// with the day it lapses and how it was earned, and the adjustments that got
+// the balance there. Amounts are hundredths of a 额度 (the client prints 8397
+// as "83.97") and moments are milliseconds; both are given here in 额度 and
+// moments.
+function parseCredits(raw) {
+  const payload = raw ?? {}
+  if (!Array.isArray(payload.items)) return null
+  const balance = payload.balance && typeof payload.balance === "object" ? payload.balance : null
+  const lots = []
+  for (const lot of balance?.lots ?? []) {
+    const id = trim(lot?.id) || String(lot?.id ?? "")
+    const credits = Number(lot?.credits)
+    const grantedAt = momentOf(lot?.grantedAt)
+    if (!id || !isFinite(credits) || credits <= 0 || !grantedAt) continue
+    const remaining = Number(lot?.remaining)
+    lots.push({
+      id,
+      credits: credits / 100,
+      remaining: isFinite(remaining) ? Math.max(0, remaining) / 100 : null,
+      grantedAt,
+      expiresAt: momentOf(lot?.expiresAt),
+      kind: trim(lot?.kind) || "other",
+    })
+  }
+  // the client's order: the lot that lapses first is the one spent first
+  lots.sort((a, b) => (a.expiresAt?.getTime() ?? Infinity) - (b.expiresAt?.getTime() ?? Infinity) || a.grantedAt - b.grantedAt)
+  const items = []
+  const seen = new Set()
+  for (const item of payload.items) {
+    const id = trim(item?.id) || String(item?.id ?? "")
+    const at = momentOf(item?.at)
+    const credits = Number(item?.credits)
+    const kind = trim(item?.kind)
+    if (!id || !kind || seen.has(id) || !at || !isFinite(credits)) continue
+    seen.add(id)
+    const source = item?.source && typeof item.source === "object" ? item.source : null
+    const type = trim(source?.type)
+    items.push({
+      id,
+      at,
+      kind,
+      credits: credits / 100,
+      state: trim(item?.state) || null,
+      title: trim(item?.title),
+      source: type === "publish" || type === "space" || type === "platform" ? type : "platform",
+    })
+  }
+  items.sort((a, b) => b.at - a.at)
+  const remaining = Number(balance?.remaining)
+  return {
+    remaining: isFinite(remaining) ? Math.max(0, remaining) / 100 : null,
+    lots,
+    items,
+    expiresAt: lots.find((l) => l.expiresAt)?.expiresAt ?? null,
+  }
+}
+
+// creditReadout asks the ledger the way the client does: the account's access
+// token as a bearer, nothing signed and nothing sealed, the newest fifty
+// entries with the balance beside them.
+async function creditReadout(cred) {
+  const res = await fetch(relayOf(cred) + CREDITS_PATH + "?limit=50", {
+    headers: { authorization: "Bearer " + cred.access, Accept: "application/json" },
+    // the client gives the ledger eight seconds: it is a card's detail, not the
+    // allowance's own read, and a slow answer must not hold the card
+    signal: AbortSignal.timeout(8 * 1000),
+  })
+  if (!res.ok) {
+    const text = (await res.text()).trim().slice(0, 512)
+    throw new HTTPStatusError(`mirasim: HTTP ${res.status}${text ? ": " + text : ""}`, res.status)
+  }
+  const parsed = parseCredits(await res.json())
+  if (!parsed) throw new Error("mirasim: the credit ledger answered nothing readable")
+  return parsed
 }
 
 // roundPercent rounds a percentage once, then saturates at 99, matching the
@@ -1254,6 +1349,46 @@ function resetTime(value) {
 function roundPercent(value) {
   value = Math.max(0, Math.min(100, Math.round(value * 10) / 10))
   return value >= 99 ? 100 : value
+}
+
+// windowOf maps one of the relay's windows into the shape magpie's card reads.
+// The use stays a percentage; `amounts` — the ledger's granted and spent 额度 —
+// rides on the account's own window only, because that is the card the client
+// draws ("83.97 / 85.91"), and a model-scoped window has its own budget the
+// ledger knows nothing about.
+function windowOf(w, amounts = null) {
+  return {
+    name: w.name,
+    used: w.usedPercent ?? (w.budget > 0 ? roundPercent((w.used / w.budget) * 100) : 0),
+    ...(amounts ? { amount: amounts.amount, limit: amounts.limit, unit: "" } : {}),
+    ...(w.resetAt ? { resetsAt: w.resetAt.toISOString(), resetSecs: Math.max(0, Math.round((w.resetAt.getTime() - Date.now()) / 1000)) } : {}),
+    ...(w.status === "limit_reached" ? { display: "used up" } : {}),
+  }
+}
+
+// amountsOf is the ledger as the card's two numbers: what was granted and what
+// of it is spent. The lots are the authority — their credits are the grant, the
+// balance is what is left of it.
+function amountsOf(credits) {
+  if (!credits || credits.remaining == null) return null
+  const granted = credits.lots.reduce((n, l) => n + (l.credits > 0 ? l.credits : 0), 0)
+  const limit = granted > 0 ? granted : credits.remaining
+  if (!(limit > 0)) return null
+  return { amount: Math.max(0, limit - credits.remaining), limit }
+}
+
+// windowOfCredits is the card when the limits route gives none: the ledger
+// alone still knows what is left and how much was granted.
+function windowOfCredits(credits) {
+  const amounts = amountsOf(credits)
+  if (!amounts) return null
+  return {
+    name: "credits",
+    used: roundPercent((amounts.amount / amounts.limit) * 100),
+    amount: amounts.amount,
+    limit: amounts.limit,
+    unit: "",
+  }
 }
 
 // ---- finishing a sign-in -----------------------------------------------------------
@@ -1717,12 +1852,14 @@ export async function MirasimAuthPlugin({ client }) {
       const credential = await locked(() => mintCredential(s, cred))
       const raw = JSON.parse(await (await signedGet(cred, s.key, credential, LIMITS_PATH, "usage")).text())
       const limits = parseLimits(raw)
-      const windows = limits.windows.map((w) => ({
-        name: w.name,
-        used: w.usedPercent ?? (w.budget > 0 ? roundPercent((w.used / w.budget) * 100) : 0),
-        ...(w.resetAt ? { resetsAt: w.resetAt.toISOString(), resetSecs: Math.max(0, Math.round((w.resetAt.getTime() - Date.now()) / 1000)) } : {}),
-        ...(w.status === "limit_reached" ? { display: "used up" } : {}),
-      }))
+      // the ledger is what the account is worth, in 额度; its read is a second
+      // route and its failure is not the allowance's
+      const credits = await creditReadout(cred).catch(() => null)
+      const amounts = amountsOf(credits)
+      const account = limits.windows.findIndex((w) => !w.modelScoped)
+      const primary = account >= 0 ? account : 0
+      const windows = limits.windows.map((w, i) => windowOf(w, amounts && i === primary ? amounts : null))
+      if (!windows.length && amounts) windows.push(windowOfCredits(credits))
       return {
         plan: cred.plan || "",
         until: Number(cred.planExpiresAt) > 0 ? new Date(Number(cred.planExpiresAt) * 1000).toISOString() : "",
@@ -1731,7 +1868,10 @@ export async function MirasimAuthPlugin({ client }) {
         signIn,
       }
     } catch (e) {
-      return { error: String(e?.message ?? e), signIn: e instanceof SignInGone && e.expired ? "expired" : signIn }
+      // the allowance read is a relay read like any other: a region refusal
+      // here is the same one the calls get, and says the same thing about a
+      // proxy
+      return { error: withRegionHint(String(e?.message ?? e)), signIn: e instanceof SignInGone && e.expired ? "expired" : signIn }
     }
   }
 
@@ -2017,6 +2157,7 @@ export const _internal = {
   withoutWithdrawn,
   upstreamModelID,
   parseLimits,
+  parseCredits,
   parseMfaChallenge,
   waitMfa,
   normalizeBody,

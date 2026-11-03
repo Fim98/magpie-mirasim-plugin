@@ -82,8 +82,28 @@ git show <sha>
 - **`/auth/mfa/status|enroll|passkeys`、`/auth/account-deletion/*`**：账户设置页的功能，本插件不做管理页。**不取**。
 - **新请求头**：`x-mirasim-turn-proof` / `-turn-reference` / `-machine-proof`（机器身份走 `/v2/gateway/*`：模型网关、vault、MCP）、`x-mirasim-git-*`、`x-mirasim-secret-refusal` / `-consumer` / `-target-host` / `-unattended`（网关与 vault）、`x-mirasim-visitor` / `-preview*`（publish）、`x-mirasim-key`（接口令牌）。推理与描述性路由都不带这些。**不取**。
 - **描述性路由未变**：`/v1/models`、`/v1/model-roster`、`/v1/limits` 的请求形状与 `x-mirasim-probe: usage` 一致；limits 的 `windows[].{name,budget,used,reset_at,model_scoped}`、`paid`、`degraded`，roster 的 `withdrawn`/`served`/`effort`/`autoCompactRatio`/`maxOutput`、catalog 的 `max_input_tokens` 字段在 0.0.665→0.0.737 之间没有任何增删。
-- **0.0.665 起就有、但仍与本插件无关**：`/v1/users/me/balance`、`/v1/subscriptions*`、`/v2/gateway/secret(s)`、`/v2/space-network`、`/v2/me/consents`（额度仍读 `/v1/limits`，余额路由没有换成它的理由）。
+- **0.0.665 起就有、但仍与本插件无关**：`/v1/users/me/balance`（Moonshot 的 BYOK 余额探针）、`/v1/subscriptions*`、`/v2/gateway/secret(s)`、`/v2/space-network`、`/v2/me/consents`。注意额度**不止** `/v1/limits`：账号真正的余额与明细走 `/v1/credits/activity`，见下一节。
 - **一个仍未验证的点**：中继是否对 `clientVersion` 设下限只能连真中继才看得出来，包里看不到。0.0.737 之后若真被拒，症状会是签名路由 401/403，换版本号即可定位。
+
+## 额度：`/v1/limits` 之外还有 `/v1/credits/activity`（2026-11-03）
+
+客户端「账号」页那张**个人额度**卡（83.97 额度、额度明细、额度变动、2027-04-23 到期）不是 `/v1/limits` 画的：limits 只把它换算成一个 30d 窗口，而且从 2026-10-23 起窗口的 `reset_at` 变成 `2126-09-29T10:16:07Z`（窗口月末 +100 年，官方客户端照单全收，自己算出 `resetAfterSeconds ≈ 3152677e3`）。真正的余额来自：
+
+```
+GET /v1/credits/activity?limit=50
+Authorization: Bearer <access token>        ← 不签名、不密封,8s 超时
+{
+  period:  { resetAt },
+  items:   [{ id, at, kind, credits, state, title, source{type:handle,item,url} }],
+  balance: { remaining, lots[{ id, credits, remaining, grantedAt, expiresAt, kind }] }
+}
+```
+
+金额是「额度」的**百分之一**（8397 → 83.97，与 limits 的 `budget: 8591` / `used: 193.6` 同一单位），时间是**毫秒**；`source.type` 是 `publish|space|platform` 之一。客户端把 lots 按 `expiresAt` 升序（先用最早到期的），items 按 `at` 降序。
+
+真机数据（`ui-cli --port 4970 call getCreditActivity`）：`remaining 8397`、`lots[{credits 8591, remaining 8397, expiresAt 1808495999000 → 2027-04-23, kind "carry"}]`、两条 `adjust`（`-8399`「计价方式调整：余额同比例换算，能用的量不变」/ `+17182`「原有余额」），与客户端截图逐项对上。
+
+**已取**：`usage()` 同时读 limits 与账本——百分比与窗口名仍来自 limits，`amount`/`limit`（额度）来自账本并只挂在账号自己的窗口上（等价于官方那张卡的「83.97 / 85.91」）；limits 一条窗口都没有时用账本单独画卡；账本读失败不影响额度卡。另外：一年以上的 reset 视为「不重置」丢弃（真中继目前就是这种值），区域拒绝在额度读取里也带上代理提示。
 
 ## 真中继实测：502 的三层原因（2026-11-02）
 
