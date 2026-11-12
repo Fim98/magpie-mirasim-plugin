@@ -123,7 +123,7 @@ function checkSignature(req, body, devicePublicB6, credential, t) {
   const sig = sealed["x-mirasim-sig"] ?? req.headers["x-mirasim-sig"]
   const client = req.headers["x-mirasim-client"]
   t.ok(id && ts && nonce && sig, "the signature headers are on" + (enc ? " (sealed)" : ""))
-  t.ok(client === "0.0.737", "the client version is reported")
+  t.ok(client === "0.0.797", "the client version is reported")
   // on a sealed request only the client and the envelope are clear
   for (const name of Object.keys(req.headers)) {
     if (enc) {
@@ -401,14 +401,14 @@ async function main() {
   await listen(relay)
   process.env.MIRASIM_ADMIN_URL = `http://127.0.0.1:${admin.address().port}`
   process.env.MIRASIM_RELAY_URL = `http://127.0.0.1:${relay.address().port}`
-  process.env.MIRASIM_CLIENT_VERSION = "0.0.737"
+  process.env.MIRASIM_CLIENT_VERSION = "0.0.797"
   // a two-step confirmation opens a page; the test must not open one
   process.env.MIRASIM_NO_OPEN = "1"
 
   const mod = await import("./index.mjs")
   const internals = mod._internal
   e2eInternals.chacha20 = internals.chacha20
-  t.eq(internals.DEFAULT_CLIENT_VERSION, "0.0.737", "the plugin signs as the released desktop client")
+  t.eq(internals.DEFAULT_CLIENT_VERSION, "0.0.797", "the plugin signs as the released desktop client")
 
   // ---- the browser sign-in
   let saved = null
@@ -472,10 +472,9 @@ async function main() {
 
   // the relay serves Messages only to the Mirasim client or Claude Code: a
   // host's own user-agent is renamed, a Claude Code call keeps its own
-  t.ok(
-    String(state.messageCalls[0].headers["user-agent"] ?? "").startsWith("Mirasim/"),
-    "the caller's own user-agent is replaced with the client this plugin signs as",
-  )
+  const signedAs = String(state.messageCalls[0].headers["user-agent"] ?? "")
+  t.ok(signedAs.startsWith("mirasim-host/0.0.797 ("), "the caller's own user-agent is replaced with the desktop client's: " + signedAs)
+  t.ok(signedAs.endsWith(`; ${process.arch})`), "the user-agent names the machine the way the desktop does")
   await loader.fetch(loader.baseURL + "/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json", "User-Agent": "claude-cli/2.1.4 (external, cli)" },

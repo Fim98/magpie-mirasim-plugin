@@ -148,6 +148,13 @@ eq("agent claude", agentFor("/v1/messages/count_tokens", ""), "claude")
 // budget-default shape (off is the disabled form, minimal the least budget)
 eq("family gemini", familyOf("gemini-3.1-pro-preview"), "gemini")
 eq("agent gemini", agentFor("/v1/messages", json({ model: "gemini-3.1-pro-preview" })), "pi")
+eq("family grok", familyOf("grok-4.7"), "grok")
+eq("agent grok", agentFor("/v1/messages", json({ model: "grok-4.7" })), "grok")
+eq("family mimo", familyOf("mimo-v2.6-pro"), "mimo")
+eq("agent mimo", agentFor("/v1/messages", json({ model: "mimo-v2.6-pro" })), "pi")
+eq("grok takes xhigh", String(effortSupported("grok", "xhigh")), "true")
+eq("grok refuses ultra", String(effortSupported("grok", "ultra")), "false")
+eq("mimo takes no rung", String(effortSupported("mimo", "high")), "false")
 eq("gemini takes minimal", String(effortSupported("gemini", "minimal")), "true")
 eq("gemini refuses xhigh", String(effortSupported("gemini", "xhigh")), "false")
 {
@@ -190,6 +197,31 @@ eq("deepseek id unchanged", upstreamModelID("deepseek-flash"), "deepseek-flash")
   eq("withdrawn dropped", JSON.stringify(withoutWithdrawn([{ id: "glm-5" }, { id: "gpt-6" }], r)), JSON.stringify([{ id: "gpt-6" }]))
   const only = parseRoster(`{"version":"1","withdrawn":["claude-old-1"]}`)
   eq("withdrawn-only roster is valid", JSON.stringify(only.withdrawn), JSON.stringify(["claude-old-1"]))
+}
+
+// the desktop's model list is the roster's served ids, not the whole catalog:
+// a family the old prefix list never named (grok, mimo) stays, a duplicate
+// the desktop collapses is dropped, and a namespaced id is not a served model
+{
+  const { selectModels } = await import("./index.mjs").then((m) => m._internal)
+  const served = parseRoster({
+    version: "1",
+    served: ["Grok-4.7", "deepseek-flash", "deepseek-v4-flash", "kimi-code/k3", "mimo-v2.6-pro"],
+    models: { "grok-4.7": { label: "grok 4.7", contextWindow: 500000, effort: ["low", "high", "xhigh"] } },
+  })
+  eq("served parsed and lowercased", JSON.stringify(served.served), JSON.stringify(["grok-4.7", "deepseek-flash", "deepseek-v4-flash", "kimi-code/k3", "mimo-v2.6-pro"]))
+  const picked = selectModels(
+    [
+      { id: "claude-old", max_input_tokens: 10 },
+      { id: "deepseek-flash", max_input_tokens: 1000000 },
+      { id: "grok-4.7", max_input_tokens: 500000 },
+    ],
+    served,
+  ).map((m) => m.id)
+  eq("served is the list", JSON.stringify(picked), JSON.stringify(["grok-4.7", "deepseek-flash", "mimo-v2.6-pro"]))
+  eq("catalog token limit kept", String(selectModels([{ id: "grok-4.7", max_input_tokens: 500000 }], served)[0].max_input_tokens), "500000")
+  const untouched = selectModels([{ id: "claude-sonnet-4-8" }], parseRoster(`{"version":"1","withdrawn":["claude-old-1"]}`)).map((m) => m.id)
+  eq("no served list keeps the catalog", JSON.stringify(untouched), JSON.stringify(["claude-sonnet-4-8"]))
 }
 
 // the relay's queue refusal is the only answer safe to resubmit, its delay

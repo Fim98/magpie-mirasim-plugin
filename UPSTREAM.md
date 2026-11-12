@@ -117,6 +117,16 @@ Authorization: Bearer <access token>        ← 不签名、不密封,8s 超时
 
 修完后的实测（经 7890，账号 admin@fimzen…）：`GET /v1/models` 200（21 个模型）、`POST /v1/responses`（gpt-6-astra）200 SSE、`POST /v1/messages`（claude-haiku-5-5，完整 body）200 SSE——即 0.0.737 的 `clientVersion` 被中继接受。
 
+## 客户端 0.0.797 复核（2026-11-12）
+
+`/Applications/Mirasim.app` 已是 `@mirasim/desktop` **0.0.797**。对照用的是本机留下的 0.0.786 `server-main.cjs`（`~/.mirasim/app/0.0.786`）和正在跑的 0.0.797 包，外加账号 `setting.json` 里缓存的 roster（`2026-11-11.v1`）。结论：**签名/密封没有换代；客户端版本号、自己的 User-Agent，以及模型名单的来源要跟着走。**
+
+- **签名与密封**：内嵌 WASM（`cc_sign` / `cc_seal`）在 0.0.786 与 0.0.797 之间 SHA-256 相同（`fd6b7870…7d95`），里面仍是 `mrs-sig-v2` / `mrs-seal-v1`。规范串、封包 AAD、`SEAL_PUBKEY`（`HlyNMMeG…Jn4=`）、明文里只留 `x-mirasim-client` 与 `x-mirasim-enc`，都没变。**已取**：`clientVersion` 与 `x-mirasim-client` 由 0.0.737 改为 **0.0.797**。
+- **User-Agent**：桌面端自己的 fetch（以及 GUI 里同一段）现在是 `mirasim-host/<version> (Darwin|Windows|Linux; arch)`，包里已经没有 `Mirasim/` 这个前缀。Claude Code 的调用仍由本地代理原样转发它自己的 UA。**已取**：宿主 UA 不是 `mirasim-host/` 或 `claude-cli/` 时，改写成桌面端这一条；设备 ticket、catalog、roster、limits 也带上同一条。
+- **模型名单**：桌面端在 roster 带 `served` 时，展示的就是这份名单（去掉带 `/` 的 id、占位符、以及 plain id 旁边的日期孪生），不再用 catalog 的家族前缀。账号缓存里的 served 含 `grok-4.6` / `grok-4.7`、`mimo-v2.6-flash` / `mimo-v2.6-pro`，以及 `deepseek-v4-flash`（桌面端在 `deepseek-flash` 也在名单里时把它丢掉）。**已取**：roster 有 `served` 就用它，没有才退回原来的 catalog 收窄；Grok 走自己的 agent 和 `low/medium/high/xhigh`，MiMo 走 pi、不发 reasoning 档。插件自己的别名（`kimi-code/k3`、`deepseek-v4.1-flash`）还是在真实 id 旁边多发一条。
+- **登录、设备 ticket、额度、limits、排队 503、401 换 ticket**：路径和字段与 0.0.786 逐段对过，没有要改的形状。0.0.797 新出现的 `x-mirasim-comments-token`、`/auth/aws/account`、`/v1/rentals/self/release` 不属于推理和登录。**不取**。
+- **内置 fallback catalog** 多了 `claude-fable-5-2` 和 `gemini-4-carbon`。本插件不内置这份名单，live catalog / served 里有就会出现。**不另写死**。
+
 ## 测试
 
 `node test.mjs`（签名/密封字节级交叉验证 + 归一化/别名/队列单元用例）

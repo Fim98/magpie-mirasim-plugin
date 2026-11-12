@@ -12,8 +12,9 @@
 // The relay serves Anthropic Messages for Claude, DeepSeek, GLM and Kimi
 // models and OpenAI Responses for GPT ones, both rewritten here into the
 // thinking form each model takes (an effort, or a token budget). The
-// account's own model catalog and roster are listed as its models, and its
-// allowance read from the limits route.
+// account's models are the roster's served list (the desktop's own), or
+// the catalog when an older roster names none, and its allowance is read
+// from the limits route.
 //
 // The protocol (endpoints, signing envelope, sign-in flows) is ported from
 // magpie's internal/mirasim, which ported it from CLIProxyAPI's mirasim
@@ -40,8 +41,10 @@ const DEFAULT_ADMIN = "https://auth.mirasim.ai"
 const ADMIN = () => (trim(process.env.MIRASIM_ADMIN_URL) || DEFAULT_ADMIN).replace(/\/+$/, "")
 const RELAY = () => (trim(process.env.MIRASIM_RELAY_URL) || DEFAULT_RELAY).replace(/\/+$/, "")
 // the desktop client this plugin signs as; the relay reads it from the
-// signed canonical string and from x-mirasim-client
-const DEFAULT_CLIENT_VERSION = "0.0.737"
+// signed canonical string and from x-mirasim-client. 0.0.797 is the
+// @mirasim/desktop this was checked against (0.0.786 carried the same
+// crypto core, byte for byte).
+const DEFAULT_CLIENT_VERSION = "0.0.797"
 
 const SESSION_PATH = "/v1/device/session"
 const MODELS_PATH = "/v1/models"
@@ -95,6 +98,16 @@ const RESERVED_IDS = new Set(["*", "gpt-4o-mini", "gpt-4o-mini-openrouter"])
 const CLIENT_VERSION = () => (process.env.MIRASIM_CLIENT_VERSION || "").trim() || DEFAULT_CLIENT_VERSION
 const LOCALE = () => (process.env.MIRASIM_LOCALE || "").trim()
 const COLLECT_OFF = () => /^(off|false)$/i.test((process.env.MIRASIM_COLLECT || "").trim())
+
+// clientUserAgent is the User-Agent the desktop client's own fetch sends
+// (mirasim-host/<version> (Darwin|Windows|Linux; arch)). A Messages call
+// from Claude Code keeps that CLI's own agent; anything else is rewritten
+// to this, which is the only identity the current app still carries.
+const HOST_PLATFORM = { darwin: "Darwin", win32: "Windows", linux: "Linux" }
+function clientUserAgent() {
+  const platform = HOST_PLATFORM[process.platform] ?? process.platform
+  return `mirasim-host/${CLIENT_VERSION()} (${platform}; ${process.arch})`
+}
 
 // locked serializes checking, rotating and saving tokens and minting
 // tickets, as a refresh token is spent once: two refreshes would spend it
@@ -427,8 +440,10 @@ function agentFor(requestPath, body) {
     model = String(JSON.parse(body).model ?? "")
   } catch {}
   const family = familyOf(model.toLowerCase())
-  if (family === "gemini") return "pi"
-  return family === "dsh" || family === "zcode" || family === "kimi" ? family : "claude"
+  // gemini and mimo are relay models the desktop drives through pi; grok,
+  // deepseek, glm and kimi each have their own agent name
+  if (family === "gemini" || family === "mimo") return "pi"
+  return family === "dsh" || family === "zcode" || family === "kimi" || family === "grok" ? family : "claude"
 }
 
 // familyOf is the family a model id belongs to, named as the relay names
@@ -440,6 +455,8 @@ function familyOf(model) {
   if (model.startsWith("kimi-")) return "kimi"
   if (model.startsWith("gpt-")) return "codex"
   if (model.startsWith("gemini-")) return "gemini"
+  if (model.startsWith("grok-")) return "grok"
+  if (model.startsWith("mimo-")) return "mimo"
   return "claude"
 }
 
@@ -453,6 +470,14 @@ function familyOf(model) {
 const selectorAliases = {
   "kimi-code/k3": "kimi-k3",
   "deepseek-v4.1-flash": "deepseek-flash",
+}
+
+// relayDuplicates are ids the desktop drops from the served list when the
+// canonical id is served beside them (its wun map). They are not selectors
+// this plugin publishes; they are the same model listed twice.
+const relayDuplicates = {
+  "deepseek-v4-flash": "deepseek-flash",
+  "deepseek-v4-flash-vision-exp": "deepseek-flash",
 }
 
 // upstreamModelID resolves a published selector to the id the relay serves.
@@ -722,6 +747,7 @@ async function mintTicket(cred, key) {
   headers.Authorization = "Bearer " + cred.access
   headers["Content-Type"] = "application/json"
   headers.Accept = "application/json"
+  headers["user-agent"] = clientUserAgent()
   const res = await fetch((relayOf(cred)) + SESSION_PATH, { method: "POST", headers, body, signal: AbortSignal.timeout(ASK_TIMEOUT) })
   if (!res.ok) {
     const text = (await res.text()).trim().slice(0, 512)
@@ -746,6 +772,7 @@ async function signedGet(cred, key, credential, requestPath, probe = "") {
   const headers = signatureHeaders(key, "GET", requestPath, credential, null, null)
   headers.Authorization = "Bearer " + credential
   headers.Accept = "application/json"
+  headers["user-agent"] = clientUserAgent()
   if (probe) headers["x-mirasim-probe"] = probe
   const res = await fetch(relayOf(cred) + requestPath, { headers, signal: AbortSignal.timeout(ASK_TIMEOUT) })
   if (!res.ok) {
@@ -759,8 +786,9 @@ const relayOf = (a) => (trim(a?.relayUrl) || RELAY()).replace(/\/+$/, "")
 
 // ---- the account's catalog and roster ---------------------------------------------
 
-// parseModels reads the account's catalog, narrowed the way the official
-// client narrows it: only the relay's own models (a family prefix, no
+// parseModels reads the account's catalog, narrowed the way an older
+// client did when the roster named no served list: only the relay's own
+// models (a family prefix, no
 // "-paid" variant — so a namespaced "owner/model" is not one, while a
 // namespaced id that carries a family prefix still is), no placeholders,
 // and a dated twin dropped when the plain id it duplicates is served
@@ -818,7 +846,9 @@ function isExposedModel(id) {
     s.startsWith("deepseek-") ||
     s.startsWith("glm-") ||
     s.startsWith("kimi-") ||
-    s.startsWith("gemini-")
+    s.startsWith("gemini-") ||
+    s.startsWith("grok-") ||
+    s.startsWith("mimo-")
   )
 }
 
@@ -862,7 +892,7 @@ function parseRoster(raw) {
   }
   const envelope = raw ?? {}
   if (!trim(envelope.version)) throw new Error("mirasim: invalid model roster")
-  const roster = { agents: {}, models: {}, withdrawn: [] }
+  const roster = { agents: {}, models: {}, withdrawn: [], served: [] }
   // the relay's withdrawn ids: lowercased, trimmed, de-duplicated, kept even
   // when no agent or model entry is left beside them
   const withdrawnSeen = new Set()
@@ -871,6 +901,17 @@ function parseRoster(raw) {
     if (id && !withdrawnSeen.has(id)) {
       roster.withdrawn.push(id)
       withdrawnSeen.add(id)
+    }
+  }
+  // served is the list the desktop actually shows, in the relay's order.
+  // Absent (not an empty array that was never sent) means an older roster,
+  // and the catalog's own narrowing is used instead.
+  const servedSeen = new Set()
+  for (const entry of envelope.served ?? []) {
+    const id = typeof entry === "string" ? entry.toLowerCase().trim() : ""
+    if (id && !servedSeen.has(id)) {
+      roster.served.push(id)
+      servedSeen.add(id)
     }
   }
   const prefix = { claude: "claude-", codex: "gpt-", dsh: "deepseek-", zcode: "glm-", kimi: "kimi-" }
@@ -893,7 +934,7 @@ function parseRoster(raw) {
     if (!spec) continue
     roster.models[key] = spec
   }
-  if (!Object.keys(roster.agents).length && !Object.keys(roster.models).length && !roster.withdrawn.length) {
+  if (!Object.keys(roster.agents).length && !Object.keys(roster.models).length && !roster.withdrawn.length && !roster.served.length) {
     throw new Error("mirasim: model roster contains no valid supported models")
   }
   return roster
@@ -983,6 +1024,8 @@ function familyEfforts(family) {
       return ["low", "high", "max"]
     case "gemini":
       return ["off", "minimal", "low", "medium", "high"]
+    case "grok":
+      return ["low", "medium", "high", "xhigh"]
   }
   return []
 }
@@ -1023,6 +1066,8 @@ function effortSupported(family, level) {
   if (family === "dsh") return level === "off" || level === "low" || level === "high" || level === "max"
   if (family === "zcode" || family === "kimi") return level === "low" || level === "high" || level === "max"
   if (family === "gemini") return level === "off" || level === "minimal" || level === "low" || level === "medium" || level === "high"
+  if (family === "grok") return level === "low" || level === "medium" || level === "high" || level === "xhigh"
+  if (family === "mimo") return false
   return level === "low" || level === "medium" || level === "high" || level === "xhigh" || level === "max" || level === "ultra"
 }
 
@@ -1662,11 +1707,10 @@ const signedInError = (e) =>
     signIn: e instanceof SignInGone ? (e.expired ? "expired" : "kept") : undefined,
   })
 
-// KNOWN_CLIENT is the user-agent the relay serves a Messages call to: its own
-// client or Claude Code, nothing else. Anything else is answered 403
-// ("this client is not supported"), so a host whose own user-agent is
-// neither is told what this plugin signs as.
-const KNOWN_CLIENT = /^(Mirasim|mirasim)\/|^claude-cli\//
+// KNOWN_CLIENT is a user-agent the relay already accepts on a Messages
+// call: the desktop client's own (mirasim-host/<version> …) or Claude
+// Code. Anything else (node, Bun, an editor) is rewritten to the desktop's.
+const KNOWN_CLIENT = /^(?:mirasim-host|claude-cli)\//
 
 // REGION_REFUSAL is the relay saying the cloud route is not offered where the
 // request came from. It is not an account problem and not a signature one: the
@@ -1934,11 +1978,11 @@ export async function MirasimAuthPlugin({ client }) {
       }
       dropBeta(h, "oauth-2025-04-20")
       for (const [name, value] of Object.entries(signedHeaders)) h.set(name, value)
-      // the relay serves a Messages call only to the Mirasim client or Claude
-      // Code, and a host's own user-agent (node's, Bun's, an editor's) is
-      // neither: the plugin signs as the Mirasim client, so it says so, while
-      // a Claude Code call keeps the name it came with
-      if (!KNOWN_CLIENT.test(trim(h.get("user-agent")))) h.set("user-agent", "Mirasim/" + CLIENT_VERSION())
+      // the relay serves a Messages call to the Mirasim client or Claude
+      // Code. A host's own user-agent (node's, Bun's, an editor's) is
+      // neither: the plugin signs as the desktop client, so it says so,
+      // while a Claude Code call keeps the name it came with.
+      if (!KNOWN_CLIENT.test(trim(h.get("user-agent")))) h.set("user-agent", clientUserAgent())
       let res
       try {
         res = await fetch(url, { method, headers: h, body: sendBody, signal: init.signal })
@@ -2059,14 +2103,56 @@ export async function MirasimAuthPlugin({ client }) {
   }
 }
 
+// narrowServed is the desktop's zXl pass over the roster's served ids:
+// no namespaced id, no placeholder, and a dated twin dropped when the
+// plain id is served beside it. Family prefixes are not required — grok
+// and mimo are relay models without one of the old prefixes.
+function narrowServed(models) {
+  const undated = new Set()
+  for (const m of models) {
+    const id = String(m.id ?? "").trim()
+    if (id && !id.includes("/") && !DATED_SUFFIX.test(id)) undated.add(id)
+  }
+  const out = []
+  const seen = new Set()
+  for (const m of models) {
+    const id = String(m.id ?? "").trim()
+    if (!id || seen.has(id) || RESERVED_IDS.has(id) || id.includes("/")) continue
+    if (DATED_SUFFIX.test(id) && undated.has(id.replace(DATED_SUFFIX, ""))) continue
+    seen.add(id)
+    out.push({ ...m, id })
+  }
+  return out
+}
+
+// selectModels is the list the desktop shows. A roster that names `served`
+// is that list (catalog rows supply max_input_tokens when they have the
+// id); an older roster with no such list falls back to the catalog the
+// caller already narrowed. Duplicate ids the desktop collapses (its wun
+// map) are dropped when the canonical id is present.
+function selectModels(catalog, roster) {
+  if (!roster?.served?.length) return catalog
+  const byId = new Map(catalog.map((m) => [String(m.id ?? "").toLowerCase().trim(), m]))
+  const items = roster.served.map((id) => {
+    const cat = byId.get(id)
+    return cat ? { ...cat, id } : { id, max_input_tokens: 0 }
+  })
+  const narrowed = narrowServed(items)
+  const present = new Set(narrowed.map((m) => m.id))
+  return narrowed.filter((m) => {
+    const target = relayDuplicates[m.id]
+    return !target || !present.has(target)
+  })
+}
+
 // listedCatalog turns one catalog and the roster beside it into the models
-// magpie lists: withdrawn ids dropped, the selectors this plugin shipped
-// published beside the relay's own id carrying the model's metadata (Kimi's
-// "kimi-code/k3" beside "kimi-k3", DeepSeek's "deepseek-v4.1-flash" beside
-// "deepseek-flash"), and the withdrawals applied once more so an alias cannot
-// bring a withdrawn id back. null when nothing survives.
+// magpie lists. When the roster names `served`, that is the list (the
+// desktop's own); otherwise the catalog already narrowed. Withdrawn ids
+// are dropped, and the selectors this plugin ships are published beside
+// the relay's own id (Kimi's "kimi-code/k3" beside "kimi-k3", DeepSeek's
+// "deepseek-v4.1-flash" beside "deepseek-flash"). null when nothing survives.
 function listedCatalog(parsed, roster) {
-  const kept = withoutWithdrawn(parsed, roster)
+  const kept = withoutWithdrawn(selectModels(parsed, roster), roster)
   if (!kept.length) return null
   const listed = Object.fromEntries(kept.map((m) => [m.id, runtimeModel(m, roster)]))
   for (const [id, model] of Object.entries(listed)) {
@@ -2155,6 +2241,7 @@ export const _internal = {
   specOf,
   thinkingAdaptive,
   withoutWithdrawn,
+  selectModels,
   upstreamModelID,
   parseLimits,
   parseCredits,
