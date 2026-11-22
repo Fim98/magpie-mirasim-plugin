@@ -473,8 +473,8 @@ async function main() {
   // the relay serves Messages only to the Mirasim client or Claude Code: a
   // host's own user-agent is renamed, a Claude Code call keeps its own
   const signedAs = String(state.messageCalls[0].headers["user-agent"] ?? "")
-  t.ok(signedAs.startsWith("mirasim-host/0.0.797 ("), "the caller's own user-agent is replaced with the desktop client's: " + signedAs)
-  t.ok(signedAs.endsWith(`; ${process.arch})`), "the user-agent names the machine the way the desktop does")
+  t.ok(signedAs.startsWith("Mirasim/0.0.797 ("), "the caller's own user-agent is replaced with the Mirasim client's: " + signedAs)
+  t.ok(signedAs.endsWith(`; ${process.arch})`), "the user-agent names the machine the way the desktop client does")
   await loader.fetch(loader.baseURL + "/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json", "User-Agent": "claude-cli/2.1.4 (external, cli)" },

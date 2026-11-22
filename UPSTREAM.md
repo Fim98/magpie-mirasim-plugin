@@ -127,6 +127,14 @@ Authorization: Bearer <access token>        ← 不签名、不密封,8s 超时
 - **登录、设备 ticket、额度、limits、排队 503、401 换 ticket**：路径和字段与 0.0.786 逐段对过，没有要改的形状。0.0.797 新出现的 `x-mirasim-comments-token`、`/auth/aws/account`、`/v1/rentals/self/release` 不属于推理和登录。**不取**。
 - **内置 fallback catalog** 多了 `claude-fable-5-2` 和 `gemini-4-carbon`。本插件不内置这份名单，live catalog / served 里有就会出现。**不另写死**。
 
+## 客户端身份复核（2026-11-22）：新账号拒绝 `mirasim-host/`
+
+对 2026-11 之后注册的中继账号实测：`/v1/messages` 带 `mirasim-host/<ver>` 一律 **403 `permission_denied`：this client is not supported; use the mirasim client or Claude Code**；同一账号、同一 body、同一签名换成 `Mirasim/<ver>` 或 `claude-cli/<ver>` 都是 200 SSE。换 device key 不影响结果，换 token 才影响——relay 按账号 cohort 决定，旧账号仍接受 `mirasim-host/`（但可能共享额度已尽，429 `plan_required`）。版本阶梯 0.0.797–0.1.0 全部被拒，拒的是前缀而不是版本。
+
+0.9.0 按 0.0.797 桌面端复核把 UA 改成 `mirasim-host/`，正好落在这批账号的拒绝名单里。**已修**：`clientUserAgent()` 改回 `Mirasim/<clientVersion> (Darwin|Windows|Linux; arch)`，`KNOWN_CLIENT` 只保留 `Mirasim/` 与 `claude-cli/`（`mirasim-host/` 不再原样转发）。
+
+验证：直连 A/B 44 个池账号 `mirasim-host` 全 403、`Mirasim/` 全 200；修补后的插件经 magpie gateway，omp 19.1.0 以 `mirasim/claude-haiku-5-5` 跑通纯文本与 bash tool call。`Mirasim/` 配瘦 body（无 `system`/`tools`）仍回 400 `bad_request`，与身份无关。
+
 ## 测试
 
 `node test.mjs`（签名/密封字节级交叉验证 + 归一化/别名/队列单元用例）

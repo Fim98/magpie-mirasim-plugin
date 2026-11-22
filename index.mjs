@@ -99,14 +99,16 @@ const CLIENT_VERSION = () => (process.env.MIRASIM_CLIENT_VERSION || "").trim() |
 const LOCALE = () => (process.env.MIRASIM_LOCALE || "").trim()
 const COLLECT_OFF = () => /^(off|false)$/i.test((process.env.MIRASIM_COLLECT || "").trim())
 
-// clientUserAgent is the User-Agent the desktop client's own fetch sends
-// (mirasim-host/<version> (Darwin|Windows|Linux; arch)). A Messages call
-// from Claude Code keeps that CLI's own agent; anything else is rewritten
-// to this, which is the only identity the current app still carries.
+// clientUserAgent is the User-Agent a Messages call is signed with:
+// Mirasim/<version> (Darwin|Windows|Linux; arch). A Messages call from
+// Claude Code keeps that CLI's own agent; anything else is rewritten to
+// this. The desktop app's own fetch says mirasim-host/…, but the relay's
+// newer accounts refuse that name on /v1/messages (403 "this client is
+// not supported"), while Mirasim/… is accepted by every account.
 const HOST_PLATFORM = { darwin: "Darwin", win32: "Windows", linux: "Linux" }
 function clientUserAgent() {
   const platform = HOST_PLATFORM[process.platform] ?? process.platform
-  return `mirasim-host/${CLIENT_VERSION()} (${platform}; ${process.arch})`
+  return `Mirasim/${CLIENT_VERSION()} (${platform}; ${process.arch})`
 }
 
 // locked serializes checking, rotating and saving tokens and minting
@@ -1708,9 +1710,10 @@ const signedInError = (e) =>
   })
 
 // KNOWN_CLIENT is a user-agent the relay already accepts on a Messages
-// call: the desktop client's own (mirasim-host/<version> …) or Claude
-// Code. Anything else (node, Bun, an editor) is rewritten to the desktop's.
-const KNOWN_CLIENT = /^(?:mirasim-host|claude-cli)\//
+// call: the Mirasim client's own (Mirasim/<version> …) or Claude Code.
+// Anything else (node, Bun, an editor, the desktop's mirasim-host/…) is
+// rewritten to the Mirasim client's.
+const KNOWN_CLIENT = /^(?:Mirasim|claude-cli)\//
 
 // REGION_REFUSAL is the relay saying the cloud route is not offered where the
 // request came from. It is not an account problem and not a signature one: the
